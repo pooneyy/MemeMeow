@@ -319,13 +319,13 @@ class ImageProcessingRepository:
             session.commit()
             return job
 
-    def _core_ready(self, session: Any, job: ImageProcessingJob) -> bool:
+    def _core_ready(self, session: Any, job: ImageProcessingJob, *, blob_store: Any | None = None) -> bool:
         """验证成功 Job 的三个核心产物仍绑定当前图片和服务端配置。"""
         try:
             meme = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == job.meme_id))
             if meme is None or meme.sha256.lower() != job.image_sha256.lower():
                 return False
-            if not image_file_matches(self.resources, self.scope, meme):
+            if not image_file_matches(self.resources, self.scope, meme, blob_store=blob_store):
                 return False
             stage_statuses = {item.stage: item.status for item in self._stages(session, job.id)}
             if any(stage_statuses.get(stage) != "succeeded" for stage in ("visual", "agent", "text_embedding")):
