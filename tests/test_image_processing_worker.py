@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 
+import backend.image_processing as image_processing
 from backend.image_processing import ImageProcessingError, ImageProcessingOptions, ImageProcessingWorker, normalize_auto_name, normalize_reverse_image_policy
 from backend.operation_policy import AllowAllOperationPolicy, GrantAssociationStore, OperationPolicyGateway, Operations, PolicyDecision
 from backend.persistence.models import ScopeContext
@@ -297,6 +298,65 @@ def test_processing_options_use_safe_defaults_but_reject_explicit_empty_values()
         normalize_auto_name("")
     with pytest.raises(ImageProcessingError, match="invalid_auto_name"):
         normalize_auto_name("false")
+
+
+def test_stage_valid_releases_database_session_before_file_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """阶段复用检查必须在数据库 Session 退出后才解析 BlobStore 和读取文件。"""
+    meme = SimpleNamespace(
+        id=uuid4(),
+        scope_id="remote",
+        storage_key="a" * 64 + ".png",
+        extension=".png",
+        size_bytes=10,
+        sha256="a" * 64,
+    )
+    expected_blob_store = object()
+
+    class _Resources:
+        """记录 Session 生命周期，验证慢文件检查不占用数据库连接。"""
+
+        def __init__(self) -> None:
+            self.active_sessions = 0
+
+        def factory(self):
+            resources = self
+
+            class _Session:
+                """返回固定 Meme 的短事务测试替身。"""
+
+                def __enter__(self):
+                    resources.active_sessions += 1
+                    return self
+
+                def __exit__(self, *_args):
+                    resources.active_sessions -= 1
+                    return False
+
+                def scalar(self, _statement):
+                    return meme
+
+            return _Session()
+
+        def blob_store_for_scope(self, _scope):
+            assert self.active_sessions == 0
+            return expected_blob_store
+
+    resources = _Resources()
+
+    def _file_check(_resources, _scope, _meme, *, blob_store: object):
+        """确认文件身份校验发生在所有数据库 Session 之外。"""
+        assert resources.active_sessions == 0
+        assert blob_store is expected_blob_store
+        return True
+
+    monkeypatch.setattr(image_processing, "image_file_matches", _file_check)
+    worker = object.__new__(ImageProcessingWorker)
+    worker.resources = resources
+    worker.scope = ScopeContext("remote")
+    job = SimpleNamespace(meme_id=meme.id, image_sha256=meme.sha256, processing_config={})
+
+    assert worker._stage_valid(job, "auto_rename") is False
+    assert resources.active_sessions == 0
 
 
 class _AttachSession:

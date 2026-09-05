@@ -115,16 +115,25 @@ class DatabaseResources:
         report["blocking_keys"] = [key for key in structural_keys if report.get(key)]
         return report
 
-    def blob_store_for_scope(self, scope_id: str | ScopeContext) -> BlobStore:
-        """读取 scope 的不可变 storage_namespace 并创建绑定 BlobStore。"""
+    def blob_store_for_scope(self, scope_id: str | ScopeContext, *, session: Session | None = None) -> BlobStore:
+        """读取 scope 的不可变 storage_namespace 并创建绑定 BlobStore。
+
+        已经处于数据库事务中的调用方必须传入当前 Session，避免为读取同一
+        scope 再嵌套申请一个连接；不传 Session 时仍保留独立调用的兼容行为。
+        """
         context = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
         scope_id = context.scope_id
         if scope_id == SCOPE_LOCAL:
             if self.blob_store is None:
                 raise DatabaseError("scope_not_found")
             return self.blob_store
-        with self.factory() as session:
+        if session is not None:
             scope = session.scalar(select(Scope).where(Scope.id == scope_id))
+            if scope is None:
+                raise DatabaseError("scope_not_found")
+            return BlobStore(root=self.data_root, scope=ScopeContext(scope_id), storage_namespace=scope.storage_namespace, local=False)
+        with self.factory() as owned_session:
+            scope = owned_session.scalar(select(Scope).where(Scope.id == scope_id))
             if scope is None:
                 raise DatabaseError("scope_not_found")
             return BlobStore(root=self.data_root, scope=ScopeContext(scope_id), storage_namespace=scope.storage_namespace, local=False)

@@ -22,6 +22,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select, text, update
 
 from backend.database import (
+    DatabaseError,
     EMBEDDING_DIMENSIONS,
     ImageProcessingAttempt,
     ImageProcessingJob,
@@ -109,15 +110,16 @@ def normalize_auto_name(value: object) -> bool:
     return value
 
 
-def image_file_matches(resources: Any, scope_id: ScopeContext | str, meme: Meme) -> bool:
-    """复核当前 scope 文件的实际大小和 SHA 是否仍匹配 Meme 记录。
+def image_file_matches(resources: Any, scope_id: ScopeContext | str, meme: Meme, *, blob_store: Any | None = None) -> bool:
+    """复核当前 scope 文件的结构、大小和 SHA 是否仍匹配 Meme 记录。
 
     该判定同时服务于成功 Job 复用和 scope 级未就绪枚举；数据库中的 SHA
     只是声明事实，不能替代对文件系统当前字节的验证。
     """
     try:
-        resolver = getattr(resources, "blob_store_for_scope", None)
-        blob_store = resolver(scope_id) if callable(resolver) else getattr(resources, "blob_store", None)
+        if blob_store is None:
+            resolver = getattr(resources, "blob_store_for_scope", None)
+            blob_store = resolver(scope_id) if callable(resolver) else getattr(resources, "blob_store", None)
         if blob_store is None:
             return False
         return bool(
@@ -129,6 +131,18 @@ def image_file_matches(resources: Any, scope_id: ScopeContext | str, meme: Meme)
         )
     except (AttributeError, TypeError, ValueError, OSError, RuntimeError):
         return False
+
+
+def _image_file_identity(meme: Meme) -> tuple[object, ...]:
+    """提取文件校验和跨事务复核所需的不可变图片身份字段。"""
+    return (
+        meme.id,
+        meme.scope_id,
+        meme.storage_key,
+        meme.extension,
+        meme.size_bytes,
+        meme.sha256,
+    )
 
 
 @dataclass(frozen=True)
@@ -289,9 +303,13 @@ class ImageProcessingRepository:
             if latest is not None and not explicit_retry and latest.processing_config_hash == config_hash and latest.reverse_image_policy == policy and bool(getattr(latest, "auto_name", False)) == auto_name_value and latest.metadata_hash == metadata_hash:
                 # 只有核心产物仍然有效时才复用成功 revision；失败或已失效
                 # revision 由后续分支创建新 revision，避免把过期状态当成就绪。
-                if latest.status == "succeeded" and self._core_ready(session, latest):
-                    session.commit()
-                    return latest
+                if latest.status == "succeeded":
+                    # 复用检查仍在当前事务中执行；BlobStore 必须复用当前
+                    # Session，不能为读取 namespace 再申请第二条连接。
+                    blob_store = self.resources.blob_store_for_scope(self.scope, session=session)
+                    if self._core_ready(session, latest, blob_store=blob_store):
+                        session.commit()
+                        return latest
             revision = (latest.revision + 1) if latest is not None else 1
             job = ImageProcessingJob(scope_id=self.scope.scope_id, meme_id=meme_uuid, revision=revision, image_sha256=image_sha256, metadata_hash=metadata_hash, processing_config_hash=config_hash, processing_config=dict(config or {}), reverse_image_policy=policy, auto_name=auto_name_value, status="queued", current_stage="visual")
             session.add(job)
@@ -1170,11 +1188,31 @@ class ImageProcessingWorker:
             )
             if meme is None or meme.sha256.lower() != job.image_sha256.lower():
                 raise ImageProcessingError("target_changed")
-            # 阶段产物绑定的是数据库中的 SHA；复用前仍要核对当前文件字节，
-            # 否则文件被外部替换后可能把旧向量误判为当前版本有效。
-            if not image_file_matches(self.resources, self.scope, meme):
-                raise ImageProcessingError("target_changed")
+            file_identity = _image_file_identity(meme)
 
+        # scope namespace 的读取和 BlobStore 的文件系统初始化也放在事务外，
+        # 因为它们不需要与后面的阶段产物查询保持同一事务。
+        try:
+            blob_store = self.resources.blob_store_for_scope(self.scope)
+        except (AttributeError, TypeError, ValueError, OSError, DatabaseError) as exc:
+            raise ImageProcessingError("target_changed") from exc
+
+        # 阶段产物绑定的是数据库中的 SHA；复用前仍要核对当前文件字节，
+        # 否则文件被外部替换后可能把旧向量误判为当前版本有效。
+        if not image_file_matches(self.resources, self.scope, meme, blob_store=blob_store):
+            raise ImageProcessingError("target_changed")
+
+        # 文件校验完成后重新打开一个短事务，确认期间数据库中的图片身份没有变化，
+        # 并只使用这次读取的 Meme 判断阶段产物，避免把旧快照写入后续流程。
+        with self.resources.factory() as session:
+            meme = session.scalar(
+                select(Meme).where(
+                    Meme.scope_id == self.scope.scope_id,
+                    Meme.id == job.meme_id,
+                )
+            )
+            if meme is None or _image_file_identity(meme) != file_identity or meme.sha256.lower() != job.image_sha256.lower():
+                raise ImageProcessingError("target_changed")
             config = dict(job.processing_config or {})
             if stage == "visual":
                 model = config.get("visual_model")

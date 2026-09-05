@@ -193,6 +193,20 @@ def test_database_resources_preserves_scope_storage_and_preflight_boundaries(mon
     other_store = resources.blob_store_for_scope("other")
     assert other_store.scope.scope_id == "other"
     assert other_store.kwargs["local"] is False
+    factory_calls = 0
+    original_factory = resources.factory
+
+    def counting_factory(*args, **kwargs):
+        """记录带已有 Session 的 scope BlobStore 解析是否错误开启新连接。"""
+        nonlocal factory_calls
+        factory_calls += 1
+        return original_factory(*args, **kwargs)
+
+    resources.factory = counting_factory
+    with original_factory() as session:
+        session_store = resources.blob_store_for_scope("other", session=session)
+    assert session_store.scope.scope_id == "other"
+    assert factory_calls == 0
     assert resources.flat_preflight("other") == {"scope_id": "other"}
     with pytest.raises(persistence_engine.DatabaseError, match="scope_not_found"):
         resources.blob_store_for_scope("missing")
