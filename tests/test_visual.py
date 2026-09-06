@@ -20,6 +20,7 @@ from backend.visual import (
     VisualEmbeddingError,
     VisualInferenceClient,
     VisualModelRunner,
+    VisualSearchService,
     validate_embedding,
 )
 
@@ -55,6 +56,100 @@ def test_visual_client_rejects_default_endpoint_without_model_configuration(tmp_
     with pytest.raises(VisualEmbeddingError) as captured:
         VisualInferenceClient(settings).embed(b"not-an-image")
     assert captured.value.code == "visual_model_not_configured"
+
+
+def test_visual_match_releases_database_session_before_storage_check() -> None:
+    """视觉候选文件校验必须在环境 Session 关闭后执行。"""
+    query_sha = "a" * 64
+    candidate_sha = "b" * 64
+    query = SimpleNamespace(
+        id="query",
+        sha256=query_sha,
+        storage_key=query_sha + ".png",
+        size_bytes=10,
+        meme_context={},
+    )
+    candidate = SimpleNamespace(
+        id="candidate",
+        sha256=candidate_sha,
+        storage_key=candidate_sha + ".png",
+        size_bytes=12,
+        meme_context={"title": "candidate"},
+    )
+    task = SimpleNamespace(
+        task_type="meme_context_generation",
+        status="running",
+        claim_generation=0,
+        payload={
+            "meme_id": "query",
+            "image_sha256": query_sha,
+            "visual_model": VISUAL_MODEL_ID,
+            "visual_dimensions": VISUAL_DIMENSIONS,
+            "preprocess_version": VISUAL_PREPROCESS_VERSION,
+        },
+    )
+
+    class _Resources:
+        """记录数据库环境和文件检查的先后关系。"""
+
+        def __init__(self) -> None:
+            self.active_sessions = 0
+            self.events: list[str] = []
+
+        def environment(self, _scope):
+            resources = self
+
+            class _Environment:
+                def __enter__(self):
+                    resources.active_sessions += 1
+                    resources.events.append("environment_enter")
+                    self.tasks = SimpleNamespace(get=lambda _task_id: task)
+                    self.memes = SimpleNamespace(get=lambda meme_id: query if meme_id == "query" else candidate)
+                    self.visual = SimpleNamespace(
+                        get=lambda _meme_id, **_kwargs: SimpleNamespace(image_sha256=query_sha, embedding=[1.0])
+                        if _meme_id == "query"
+                        else None,
+                        match=lambda *_args, **_kwargs: [(SimpleNamespace(), candidate, 0.5)],
+                    )
+                    return self
+
+                def __exit__(self, *_args):
+                    resources.active_sessions -= 1
+                    resources.events.append("environment_exit")
+                    return False
+
+            return _Environment()
+
+        def blob_store_for_scope(self, _scope):
+            assert self.active_sessions == 0
+            self.events.append("blob_store")
+            resources = self
+
+            class _Blob:
+                def resolve(self, _key):
+                    assert resources.active_sessions == 0
+                    resources.events.append("resolve")
+                    return Path("/tmp/image.png")
+
+                def exists_with_identity(self, _key, **_kwargs):
+                    assert resources.active_sessions == 0
+                    resources.events.append("file_check")
+                    return True
+
+            return _Blob()
+
+    resources = _Resources()
+    settings = SimpleNamespace(
+        visual_model=VISUAL_MODEL_ID,
+        visual_model_dimensions=VISUAL_DIMENSIONS,
+        visual_preprocess_version=VISUAL_PREPROCESS_VERSION,
+    )
+    result = VisualSearchService(settings, resources).match(task_id="task-1", require_storage=True)
+
+    assert result["results"][0]["meme_id"] == "candidate"
+    assert resources.active_sessions == 0
+    assert resources.events.index("environment_exit") < resources.events.index("blob_store")
+    assert resources.events.index("environment_exit") < resources.events.index("file_check")
 
 
 def test_visual_client_health_rejects_mismatched_model_identity(tmp_path: Path) -> None:

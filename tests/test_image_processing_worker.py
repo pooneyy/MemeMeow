@@ -359,6 +359,98 @@ def test_stage_valid_releases_database_session_before_file_check(monkeypatch: py
     assert resources.active_sessions == 0
 
 
+def test_create_or_reuse_releases_database_session_before_file_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """成功 Job 复用时，原图 SHA 校验不得占用数据库连接或行锁。"""
+    from backend.image_processing import ImageProcessingRepository, processing_config_hash
+
+    meme = SimpleNamespace(
+        id=uuid4(),
+        scope_id="remote",
+        storage_key="a" * 64 + ".png",
+        extension=".png",
+        size_bytes=10,
+        sha256="a" * 64,
+    )
+    latest = SimpleNamespace(
+        id=uuid4(),
+        meme_id=meme.id,
+        revision=1,
+        status="succeeded",
+        image_sha256=meme.sha256,
+        processing_config_hash=processing_config_hash({}),
+        reverse_image_policy="forbid",
+        metadata_hash=None,
+        auto_name=False,
+        processing_config={},
+    )
+
+    class _Resources:
+        """提供可观察 Session 生命周期的最小资源替身。"""
+
+        def __init__(self) -> None:
+            self.active_sessions = 0
+            self.session_count = 0
+            self.events: list[str] = []
+
+        def factory(self):
+            resources = self
+            resources.session_count += 1
+
+            class _Bind:
+                class dialect:
+                    name = "sqlite"
+
+            class _Session:
+                def __enter__(self):
+                    resources.active_sessions += 1
+                    resources.events.append("session_enter")
+                    return self
+
+                def __exit__(self, *_args):
+                    resources.active_sessions -= 1
+                    resources.events.append("session_exit")
+                    return False
+
+                def get_bind(self):
+                    return _Bind()
+
+                def scalar(self, _statement):
+                    return meme
+
+                def scalars(self, _statement):
+                    return [latest]
+
+                def commit(self):
+                    resources.events.append("commit")
+
+            return _Session()
+
+        def blob_store_for_scope(self, _scope):
+            assert self.active_sessions == 0
+            self.events.append("blob_store")
+            return object()
+
+    resources = _Resources()
+    repository = ImageProcessingRepository(resources, "remote")
+    repository._core_ready = lambda _session, _job: True
+
+    def _file_check(_resources, _scope, _meme, *, blob_store):
+        assert resources.active_sessions == 0
+        assert blob_store is not None
+        resources.events.append("file_check")
+        return True
+
+    monkeypatch.setattr(image_processing, "image_file_matches", _file_check)
+
+    reused = repository.create_or_reuse(meme.id, meme.sha256)
+
+    assert reused is latest
+    assert resources.session_count == 2
+    assert resources.events.index("session_exit") < resources.events.index("blob_store")
+    assert resources.events.index("file_check") < resources.events.index("session_enter", 1)
+    assert resources.active_sessions == 0
+
+
 class _AttachSession:
     """按固定查询顺序返回 Job、阶段和叶子任务的绑定测试 session。"""
 

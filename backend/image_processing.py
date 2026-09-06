@@ -270,15 +270,14 @@ class ImageProcessingRepository:
         if metadata_hash is not None and (len(metadata_hash) != 64 or any(char not in "0123456789abcdefABCDEF" for char in metadata_hash)):
             raise ImageProcessingError("target_changed")
         image_sha256 = image_sha256.lower()
+
+        # 只有成功 Job 可能需要慢速文件校验；先在短事务中冻结图片身份和候选 Job，
+        # 让后续文件读取发生在连接已归还连接池之后。
+        candidate_job_id: UUID | None = None
+        candidate_file_identity: tuple[object, ...] | None = None
+        candidate_meme: Meme | None = None
         with self._session() as session:
-            # 没有既有行时 FOR UPDATE 无法锁住目标；按 scope/图片版本加事务锁，
-            # 保证并发首次提交只产生一个 revision。
-            bind = session.get_bind()
-            if getattr(getattr(bind, "dialect", None), "name", None) == "postgresql":
-                session.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-                    {"key": f"mememeow:image-processing:{self.scope.scope_id}:{meme_uuid}:{image_sha256}"},
-                )
+            self._lock_image_revision(session, meme_uuid, image_sha256)
             meme = session.scalar(
                 select(Meme).where(
                     Meme.scope_id == self.scope.scope_id,
@@ -300,32 +299,116 @@ class ImageProcessingRepository:
                 session.commit()
                 return active
             latest = rows[0] if rows else None
-            if latest is not None and not explicit_retry and latest.processing_config_hash == config_hash and latest.reverse_image_policy == policy and bool(getattr(latest, "auto_name", False)) == auto_name_value and latest.metadata_hash == metadata_hash:
-                # 只有核心产物仍然有效时才复用成功 revision；失败或已失效
-                # revision 由后续分支创建新 revision，避免把过期状态当成就绪。
-                if latest.status == "succeeded":
-                    # 复用检查仍在当前事务中执行；BlobStore 必须复用当前
-                    # Session，不能为读取 namespace 再申请第二条连接。
-                    blob_store = self.resources.blob_store_for_scope(self.scope, session=session)
-                    if self._core_ready(session, latest, blob_store=blob_store):
-                        session.commit()
-                        return latest
-            revision = (latest.revision + 1) if latest is not None else 1
-            job = ImageProcessingJob(scope_id=self.scope.scope_id, meme_id=meme_uuid, revision=revision, image_sha256=image_sha256, metadata_hash=metadata_hash, processing_config_hash=config_hash, processing_config=dict(config or {}), reverse_image_policy=policy, auto_name=auto_name_value, status="queued", current_stage="visual")
-            session.add(job)
-            session.flush()
-            for stage in STAGES:
-                session.add(ImageProcessingStage(scope_id=self.scope.scope_id, job_id=job.id, stage=stage, status="skipped" if stage == "auto_rename" and not auto_name_value else "queued"))
+            can_check_latest = (
+                latest is not None
+                and not explicit_retry
+                and latest.processing_config_hash == config_hash
+                and latest.reverse_image_policy == policy
+                and bool(getattr(latest, "auto_name", False)) == auto_name_value
+                and latest.metadata_hash == metadata_hash
+                and latest.status == "succeeded"
+            )
+            if can_check_latest:
+                candidate_job_id = latest.id
+                candidate_meme = meme
+                candidate_file_identity = _image_file_identity(meme)
+                session.commit()
+            else:
+                job = self._new_queued_job(
+                    session,
+                    meme_uuid=meme_uuid,
+                    image_sha256=image_sha256,
+                    metadata_hash=metadata_hash,
+                    config=config,
+                    config_hash=config_hash,
+                    policy=policy,
+                    auto_name_value=auto_name_value,
+                    latest=latest,
+                )
+                session.commit()
+                return job
+
+        # 读取原图并计算 SHA 可能耗时很久；此时不持有数据库 Session、行锁或
+        # advisory 锁。失败时创建新的 queued revision，保持旧逻辑的 fail-closed 行为。
+        file_is_valid = False
+        if candidate_meme is not None and candidate_file_identity is not None:
+            try:
+                blob_store = self.resources.blob_store_for_scope(self.scope)
+                file_is_valid = image_file_matches(self.resources, self.scope, candidate_meme, blob_store=blob_store)
+            except (AttributeError, TypeError, ValueError, OSError, DatabaseError):
+                file_is_valid = False
+
+        # 文件校验完成后重新获取同一 advisory 锁，复核 Job、图片身份和数据库产物。
+        # 期间若别的请求已经创建活动 Job，则按原有策略返回或报告冲突。
+        with self._session() as session:
+            self._lock_image_revision(session, meme_uuid, image_sha256)
+            meme = session.scalar(
+                select(Meme).where(
+                    Meme.scope_id == self.scope.scope_id,
+                    Meme.id == meme_uuid,
+                )
+            )
+            if meme is None or meme.sha256.lower() != image_sha256.lower():
+                raise ImageProcessingError("target_changed")
+            rows = list(
+                session.scalars(
+                    select(ImageProcessingJob)
+                    .where(
+                        ImageProcessingJob.scope_id == self.scope.scope_id,
+                        ImageProcessingJob.meme_id == meme_uuid,
+                        ImageProcessingJob.image_sha256 == image_sha256,
+                    )
+                    .order_by(ImageProcessingJob.revision.desc(), ImageProcessingJob.created_at.desc())
+                    .with_for_update()
+                )
+            )
+            active = next((row for row in rows if row.status in ACTIVE_JOB_STATUSES), None)
+            if active is not None:
+                if active.processing_config_hash != config_hash or active.reverse_image_policy != policy or active.metadata_hash != metadata_hash:
+                    raise ImageProcessingError("generation_policy_conflict")
+                if bool(getattr(active, "auto_name", False)) != auto_name_value:
+                    raise ImageProcessingError("processing_options_conflict")
+                session.commit()
+                return active
+            latest = rows[0] if rows else None
+            same_candidate = (
+                latest is not None
+                and candidate_job_id is not None
+                and latest.id == candidate_job_id
+                and latest.processing_config_hash == config_hash
+                and latest.reverse_image_policy == policy
+                and bool(getattr(latest, "auto_name", False)) == auto_name_value
+                and latest.metadata_hash == metadata_hash
+                and latest.status == "succeeded"
+                and candidate_file_identity == _image_file_identity(meme)
+                and file_is_valid
+            )
+            if same_candidate and self._core_ready(session, latest):
+                session.commit()
+                return latest
+            job = self._new_queued_job(
+                session,
+                meme_uuid=meme_uuid,
+                image_sha256=image_sha256,
+                metadata_hash=metadata_hash,
+                config=config,
+                config_hash=config_hash,
+                policy=policy,
+                auto_name_value=auto_name_value,
+                latest=latest,
+            )
             session.commit()
             return job
 
-    def _core_ready(self, session: Any, job: ImageProcessingJob, *, blob_store: Any | None = None) -> bool:
-        """验证成功 Job 的三个核心产物仍绑定当前图片和服务端配置。"""
+    def _core_ready(self, session: Any, job: ImageProcessingJob) -> bool:
+        """只在数据库事务内验证成功 Job 的阶段和产物绑定关系。
+
+        原图文件的存在、大小和 SHA 由 ``create_or_reuse`` 在事务外检查；本函数不能
+        触碰 BlobStore，避免在持有连接和行锁时读取大文件。
+        """
         try:
             meme = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == job.meme_id))
             if meme is None or meme.sha256.lower() != job.image_sha256.lower():
-                return False
-            if not image_file_matches(self.resources, self.scope, meme, blob_store=blob_store):
                 return False
             stage_statuses = {item.stage: item.status for item in self._stages(session, job.id)}
             if any(stage_statuses.get(stage) != "succeeded" for stage in ("visual", "agent", "text_embedding")):
@@ -386,6 +469,61 @@ class ImageProcessingRepository:
             return text_row is not None
         except (TypeError, ValueError, AttributeError):
             return False
+
+    def _lock_image_revision(self, session: Any, meme_uuid: UUID, image_sha256: str) -> None:
+        """为同一 scope、图片和 SHA 获取事务级去重锁。
+
+        PostgreSQL 中首次创建 revision 时没有可供 ``FOR UPDATE`` 锁定的 Job 行，
+        因此使用 advisory xact lock 保证并发请求不会同时创建相同 revision。锁只在
+        当前短事务内有效，文件系统校验不会占用它。
+        """
+        bind = session.get_bind()
+        if getattr(getattr(bind, "dialect", None), "name", None) == "postgresql":
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                {"key": f"mememeow:image-processing:{self.scope.scope_id}:{meme_uuid}:{image_sha256}"},
+            )
+
+    def _new_queued_job(
+        self,
+        session: Any,
+        *,
+        meme_uuid: UUID,
+        image_sha256: str,
+        metadata_hash: str | None,
+        config: Mapping[str, object] | None,
+        config_hash: str,
+        policy: str,
+        auto_name_value: bool,
+        latest: ImageProcessingJob | None,
+    ) -> ImageProcessingJob:
+        """在当前短事务中创建 queued Job 及其固定阶段行。"""
+        revision = (latest.revision + 1) if latest is not None else 1
+        job = ImageProcessingJob(
+            scope_id=self.scope.scope_id,
+            meme_id=meme_uuid,
+            revision=revision,
+            image_sha256=image_sha256,
+            metadata_hash=metadata_hash,
+            processing_config_hash=config_hash,
+            processing_config=dict(config or {}),
+            reverse_image_policy=policy,
+            auto_name=auto_name_value,
+            status="queued",
+            current_stage="visual",
+        )
+        session.add(job)
+        session.flush()
+        for stage in STAGES:
+            session.add(
+                ImageProcessingStage(
+                    scope_id=self.scope.scope_id,
+                    job_id=job.id,
+                    stage=stage,
+                    status="skipped" if stage == "auto_rename" and not auto_name_value else "queued",
+                )
+            )
+        return job
 
     def snapshot(self, job_id: UUID | str) -> ImageProcessingSnapshot | None:
         """读取 job 和阶段有限诊断。"""
