@@ -1042,6 +1042,7 @@ class PostgresTaskService:
                 raise RuntimeError("visual_match_snapshot_invalid")
             # resume 不能只相信旧 payload；Meme 或 BlobStore 在上次 attempt 后被
             # 替换时，必须在 grant 前收束为 target_changed，避免对新图片运行旧事实。
+            current_identity: tuple[object, object, object] | None = None
             with self.resources.environment(self.scope.scope_id) as environment:
                 memes = getattr(environment, "memes", None)
                 get_meme = getattr(memes, "get", None)
@@ -1049,20 +1050,34 @@ class PostgresTaskService:
                     current_meme = get_meme(meme_id)
                     if current_meme is None or str(getattr(current_meme, "sha256", "")).lower() != expected_sha:
                         raise RuntimeError("target_changed")
-                    blob_resolver = getattr(self.resources, "blob_store_for_scope", None)
-                    if callable(blob_resolver):
-                        try:
-                            blob = blob_resolver(self.scope.scope_id)
-                            if not blob.exists_with_identity(
-                                getattr(current_meme, "storage_key", None),
-                                sha256=expected_sha,
-                                size_bytes=getattr(current_meme, "size_bytes", None),
-                            ):
-                                raise RuntimeError("target_changed")
-                        except RuntimeError:
-                            raise
-                        except Exception as exc:  # noqa: BLE001 - 目标文件校验必须 fail-closed
-                            raise RuntimeError("target_changed") from exc
+                    current_identity = (
+                        getattr(current_meme, "storage_key", None),
+                        expected_sha,
+                        getattr(current_meme, "size_bytes", None),
+                    )
+            blob_resolver = getattr(self.resources, "blob_store_for_scope", None)
+            if current_identity is not None and callable(blob_resolver):
+                try:
+                    blob = blob_resolver(self.scope.scope_id)
+                    storage_key, image_sha256, size_bytes = current_identity
+                    if not blob.exists_with_identity(storage_key, sha256=image_sha256, size_bytes=size_bytes):
+                        raise RuntimeError("target_changed")
+                except RuntimeError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 目标文件校验必须 fail-closed
+                    raise RuntimeError("target_changed") from exc
+                with self.resources.environment(self.scope.scope_id) as environment:
+                    memes = getattr(environment, "memes", None)
+                    get_meme = getattr(memes, "get", None)
+                    if callable(get_meme):
+                        latest_meme = get_meme(meme_id)
+                        if (
+                            latest_meme is None
+                            or getattr(latest_meme, "storage_key", None) != storage_key
+                            or str(getattr(latest_meme, "sha256", "")).lower() != image_sha256
+                            or getattr(latest_meme, "size_bytes", None) != size_bytes
+                        ):
+                            raise RuntimeError("target_changed")
             summary = visual_match_snapshot_summary(snapshot)
             # 旧任务的 payload 可能没有视觉身份字段；迁移后将 snapshot 的已
             # 校验身份放入当前 handler payload，并由 claim-fenced 更新持久迁移字段。

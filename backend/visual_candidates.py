@@ -195,13 +195,18 @@ def _validate_materialized_tree(root: Path, snapshot: Mapping[str, object]) -> N
             raise VisualCandidateMaterializationError()
 
 
-def _validate_snapshot_sources(resources: Any, context: TrustedWorkspaceContext, snapshot: Mapping[str, object]) -> None:
-    """在每次物化或 resume 复用前复核同 scope 候选的当前文件身份。"""
+def _validate_snapshot_sources(resources: Any, context: TrustedWorkspaceContext, snapshot: Mapping[str, object]) -> list[tuple[str, str, str, int]]:
+    """在每次物化或 resume 复用前复核候选身份，并返回不可变源快照。
+
+    数据库查询只负责读取 Meme 的存储身份；文件存在性和 SHA 校验在 Session 关闭后
+    执行，完成后再用一个短事务确认数据库身份没有变化。
+    """
     candidates = snapshot.get("candidates")
     if not isinstance(candidates, list):
         raise VisualCandidateMaterializationError()
     try:
         blob = resources.blob_store_for_scope(context.scope_id)
+        source_rows: list[tuple[str, str, str, int]] = []
         with resources.environment(context.scope_id) as environment:
             for candidate in candidates:
                 if not isinstance(candidate, Mapping):
@@ -222,9 +227,23 @@ def _validate_snapshot_sources(resources: Any, context: TrustedWorkspaceContext,
                     meme is None
                     or str(meme.sha256).lower() != image_sha256.lower()
                     or int(meme.size_bytes) != size_bytes
-                    or not blob.exists_with_identity(meme.storage_key, sha256=image_sha256, size_bytes=size_bytes)
                 ):
                     raise VisualCandidateMaterializationError()
+                source_rows.append((meme_id, str(meme.storage_key), image_sha256.lower(), size_bytes))
+        for _meme_id, storage_key, image_sha256, size_bytes in source_rows:
+            if not blob.exists_with_identity(storage_key, sha256=image_sha256, size_bytes=size_bytes):
+                raise VisualCandidateMaterializationError()
+        with resources.environment(context.scope_id) as environment:
+            for meme_id, storage_key, image_sha256, size_bytes in source_rows:
+                meme = environment.memes.get(meme_id)
+                if (
+                    meme is None
+                    or str(meme.storage_key) != storage_key
+                    or str(meme.sha256).lower() != image_sha256
+                    or int(meme.size_bytes) != size_bytes
+                ):
+                    raise VisualCandidateMaterializationError()
+        return source_rows
     except VisualCandidateMaterializationError:
         raise
     except Exception as exc:  # noqa: BLE001 - 源身份复核必须统一失败关闭
@@ -281,7 +300,7 @@ def materialize_local_candidates(resources: Any, context: TrustedWorkspaceContex
     expected_sha256 = str(expected_manifest["snapshot_sha256"])
     root = Path(resolved.candidate_root)
     validate_directory_path(root.parent, create=True, code="visual_candidate_materialization_failed")
-    _validate_snapshot_sources(resources, context, snapshot)
+    source_rows = _validate_snapshot_sources(resources, context, snapshot)
     if root.exists() or root.is_symlink():
         validate_directory_path(root, code="visual_candidate_materialization_failed")
         existing = _read_existing_manifest(root / "manifest.json", expected_sha256=expected_sha256)
@@ -295,32 +314,49 @@ def materialize_local_candidates(resources: Any, context: TrustedWorkspaceContex
     try:
         temporary.mkdir(mode=0o700)
         blob = resources.blob_store_for_scope(context.scope_id)
+        source_map: dict[str, tuple[str, str, int]] = {}
         with resources.environment(context.scope_id) as environment:
-            for candidate in snapshot["candidates"]:
-                if not isinstance(candidate, Mapping):
-                    raise VisualCandidateMaterializationError()
-                meme_id = candidate.get("meme_id")
-                image_sha256 = candidate.get("image_sha256")
-                size_bytes = candidate.get("size_bytes")
-                relative_path = candidate.get("relative_path")
+            for meme_id, storage_key, image_sha256, size_bytes in source_rows:
+                meme = environment.memes.get(meme_id)
                 if (
-                    not isinstance(meme_id, str)
-                    or not isinstance(image_sha256, str)
-                    or not isinstance(size_bytes, int)
-                    or isinstance(size_bytes, bool)
-                    or not isinstance(relative_path, str)
+                    meme is None
+                    or str(meme.storage_key) != storage_key
+                    or str(meme.sha256).lower() != image_sha256
+                    or int(meme.size_bytes) != size_bytes
                 ):
                     raise VisualCandidateMaterializationError()
-                if size_bytes > MAX_CANDIDATE_FILE_BYTES:
-                    raise VisualCandidateMaterializationError()
+                source_map[meme_id] = (storage_key, image_sha256, size_bytes)
+        for candidate in snapshot["candidates"]:
+            if not isinstance(candidate, Mapping):
+                raise VisualCandidateMaterializationError()
+            meme_id = candidate.get("meme_id")
+            image_sha256 = candidate.get("image_sha256")
+            size_bytes = candidate.get("size_bytes")
+            relative_path = candidate.get("relative_path")
+            if (
+                not isinstance(meme_id, str)
+                or not isinstance(image_sha256, str)
+                or not isinstance(size_bytes, int)
+                or isinstance(size_bytes, bool)
+                or not isinstance(relative_path, str)
+            ):
+                raise VisualCandidateMaterializationError()
+            source_identity = source_map.get(meme_id)
+            if source_identity is None or source_identity[1] != image_sha256.lower() or source_identity[2] != size_bytes:
+                raise VisualCandidateMaterializationError()
+            source = blob.resolve(source_identity[0])
+            target = temporary.joinpath(*PurePosixPath(relative_path).parts)
+            _copy_identity(source, target, sha256=image_sha256, size_bytes=size_bytes)
+        with resources.environment(context.scope_id) as environment:
+            for meme_id, storage_key, image_sha256, size_bytes in source_rows:
                 meme = environment.memes.get(meme_id)
-                if meme is None or str(meme.sha256).lower() != image_sha256.lower() or int(meme.size_bytes) != size_bytes:
+                if (
+                    meme is None
+                    or str(meme.storage_key) != storage_key
+                    or str(meme.sha256).lower() != image_sha256
+                    or int(meme.size_bytes) != size_bytes
+                ):
                     raise VisualCandidateMaterializationError()
-                if not blob.exists_with_identity(meme.storage_key, sha256=image_sha256, size_bytes=size_bytes):
-                    raise VisualCandidateMaterializationError()
-                source = blob.resolve(meme.storage_key)
-                target = temporary.joinpath(*PurePosixPath(relative_path).parts)
-                _copy_identity(source, target, sha256=image_sha256, size_bytes=size_bytes)
         manifest_path = temporary / "manifest.json"
         raw_manifest = (json.dumps(expected_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
         descriptor = os.open(
