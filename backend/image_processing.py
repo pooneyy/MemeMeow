@@ -400,12 +400,14 @@ class ImageProcessingRepository:
             session.commit()
             return job
 
-    def _core_ready(self, session: Any, job: ImageProcessingJob) -> bool:
+    def _core_ready(self, session: Any, job: ImageProcessingJob, *, blob_store: Any | None = None) -> bool:
         """只在数据库事务内验证成功 Job 的阶段和产物绑定关系。
 
         原图文件的存在、大小和 SHA 由 ``create_or_reuse`` 在事务外检查；本函数不能
-        触碰 BlobStore，避免在持有连接和行锁时读取大文件。
+        触碰 BlobStore，避免在持有连接和行锁时读取大文件。保留 ``blob_store`` 参数
+        是为了兼容旧的内部调用，但该参数不会被使用。
         """
+        del blob_store
         try:
             meme = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == job.meme_id))
             if meme is None or meme.sha256.lower() != job.image_sha256.lower():
