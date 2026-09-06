@@ -51,6 +51,8 @@ VISUAL_CHECKPOINT_FILENAME = _ACTIVE_VISUAL_SPEC.checkpoint_filename
 # 保留历史常量，便于旧部署脚本读取 DINOv3 清单但不会将其作为活动模型加载。
 DINOV2_CHECKPOINT_FILENAME = VISUAL_MODEL_SPECS["dinov2_vitb14"].checkpoint_filename
 DINOV3_CHECKPOINT_FILENAME = VISUAL_MODEL_SPECS["dinov3_vith16plus"].checkpoint_filename
+# 只有达到该余弦相似度的图片才可作为 Agent 的参考候选，避免弱相似图片污染语境。
+MIN_VISUAL_CANDIDATE_SCORE = 0.8
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 
 
@@ -566,7 +568,16 @@ class VisualSearchService:
             if query_embedding is None or str(query_embedding.image_sha256).lower() != str(query_meme.sha256).lower():
                 raise VisualSearchError("query_embedding_not_ready", "查询图片视觉向量尚未就绪", status_code=409)
             rows = environment.visual.match(query_embedding.embedding, model=self.identity.model, preprocess_version=self.identity.preprocess_version, dimensions=self.identity.dimensions, limit=top_k, exclude_meme_id=meme_id if exclude_self else None)
-            candidate_rows = list(rows)
+            # 视觉查询只保证排序，不保证最相似项真的足够相似；低于门槛的项不能
+            # 进入 Agent manifest，否则候选语境可能覆盖当前图片的独立观察。
+            candidate_rows = []
+            for row in rows:
+                try:
+                    score = float(row[2])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if math.isfinite(score) and score >= MIN_VISUAL_CANDIDATE_SCORE:
+                    candidate_rows.append(row)
 
         try:
             blob = self.resources.blob_store_for_scope(self.scope.scope_id)

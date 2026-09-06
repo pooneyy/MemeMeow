@@ -58,8 +58,8 @@ def test_visual_client_rejects_default_endpoint_without_model_configuration(tmp_
     assert captured.value.code == "visual_model_not_configured"
 
 
-def test_visual_match_releases_database_session_before_storage_check() -> None:
-    """视觉候选文件校验必须在环境 Session 关闭后执行。"""
+def test_visual_match_filters_weak_candidates_before_storage_check() -> None:
+    """视觉候选低于最低相似度时不应提供，且文件校验仍在 Session 关闭后执行。"""
     query_sha = "a" * 64
     candidate_sha = "b" * 64
     query = SimpleNamespace(
@@ -146,10 +146,10 @@ def test_visual_match_releases_database_session_before_storage_check() -> None:
     )
     result = VisualSearchService(settings, resources).match(task_id="task-1", require_storage=True)
 
-    assert result["results"][0]["meme_id"] == "candidate"
+    assert result["results"] == []
     assert resources.active_sessions == 0
     assert resources.events.index("environment_exit") < resources.events.index("blob_store")
-    assert resources.events.index("environment_exit") < resources.events.index("file_check")
+    assert "file_check" not in resources.events
 
 
 def test_visual_client_health_rejects_mismatched_model_identity(tmp_path: Path) -> None:
