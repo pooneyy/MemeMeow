@@ -1630,8 +1630,6 @@ def _core_image_readiness(request: Request, record: Meme, image: Path, policy: s
     if not image_file_matches(request.app.state.database, _request_scope(request), record):
         return {stage: False for stage in readiness}
     metadata_hash = ImageProcessingWorker._metadata_hash(record)
-    if metadata_hash is None:
-        return readiness
 
     # 当前文件身份已确认，三个核心产物分别按当前配置和输入指纹核对，不能把
     # 某一个缺失产物连带误判为其它阶段也已就绪。
@@ -1646,19 +1644,20 @@ def _core_image_readiness(request: Request, record: Meme, image: Path, policy: s
                 image_sha256=record.sha256,
             )
             readiness["visual"] = visual is not None and visual.embedding is not None
-            text_row = environment.uow.session.scalar(
-                select(MemeTextEmbedding).where(
-                    MemeTextEmbedding.scope_id == _request_scope(request).scope_id,
-                    MemeTextEmbedding.meme_id == record.id,
-                    MemeTextEmbedding.image_sha256 == record.sha256,
-                    MemeTextEmbedding.metadata_hash == metadata_hash,
-                    MemeTextEmbedding.embedding_model_version == config.get("embedding_model"),
-                    MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
-                    MemeTextEmbedding.status == "ready",
-                    MemeTextEmbedding.embedding.is_not(None),
+            if metadata_hash is not None:
+                text_row = environment.uow.session.scalar(
+                    select(MemeTextEmbedding).where(
+                        MemeTextEmbedding.scope_id == _request_scope(request).scope_id,
+                        MemeTextEmbedding.meme_id == record.id,
+                        MemeTextEmbedding.image_sha256 == record.sha256,
+                        MemeTextEmbedding.metadata_hash == metadata_hash,
+                        MemeTextEmbedding.embedding_model_version == config.get("embedding_model"),
+                        MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
+                        MemeTextEmbedding.status == "ready",
+                        MemeTextEmbedding.embedding.is_not(None),
+                    )
                 )
-            )
-            readiness["text_embedding"] = text_row is not None
+                readiness["text_embedding"] = text_row is not None
     except Exception:  # noqa: BLE001 - 就绪判断是安全边界，任一异常都必须 fail-closed
         return {stage: False for stage in readiness}
 
@@ -1776,13 +1775,8 @@ async def process_unready_image_library(request: Request, payload: ProcessingBat
                 if all(readiness[stage] for stage in ("visual", "agent", "text_embedding")) and (
                     not options.auto_name or readiness["auto_rename"]
                 ):
-                    results.append(
-                        {
-                            "meme_id": str(meme.id),
-                            "reason": "already_ready",
-                            "category": "not_needed",
-                        }
-                    )
+                    # 首次扫描时已就绪的图片不是修复目标；只有图片锁内复核后
+                    # 转为就绪的候选才需要返回 not_needed。
                     continue
                 snapshot = worker.submit(
                     meme.id,

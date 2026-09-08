@@ -191,8 +191,8 @@ def test_image_processing_submission_maps_option_error_before_page_read() -> Non
     assert called == [True]
 
 
-def test_scope_repair_reports_images_that_are_already_ready(monkeypatch: pytest.MonkeyPatch) -> None:
-    """scope 修复必须把无需处理的图片保留在逐图结果和汇总计数中。"""
+def test_scope_repair_omits_images_that_are_already_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """首次扫描已经就绪的图片不是修复目标。"""
     records = [_record("ready-a.png"), _record("ready-b.png")]
     scalar_calls = 0
 
@@ -232,15 +232,12 @@ def test_scope_repair_reports_images_that_are_already_ready(monkeypatch: pytest.
     payload = api.ProcessingBatchRequest(reverse_image_policy="forbid", auto_name=False)
     result = asyncio.run(api.process_unready_image_library(SimpleNamespace(query_params={}), payload))
 
-    assert result["target_count"] == 2
+    assert result["target_count"] == 0
     assert result["submitted_count"] == 0
-    assert result["not_needed_count"] == 2
+    assert result["not_needed_count"] == 0
     assert result["conflict_count"] == 0
     assert result["failed_count"] == 0
-    assert result["results"] == [
-        {"meme_id": str(records[0].id), "reason": "already_ready", "category": "not_needed"},
-        {"meme_id": str(records[1].id), "reason": "already_ready", "category": "not_needed"},
-    ]
+    assert result["results"] == []
 
 
 def test_core_image_ready_does_not_hide_active_standalone_task(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -46,6 +46,7 @@ from backend.agent_resume import (
 )
 from backend.config import validate_agent_concurrency
 from executor.agent_limits import validate_agent_concurrency_at_most
+from backend.image_stage_plan import IMAGE_PROCESSING_MAX_ATTEMPTS, image_task_requires_single_attempt
 from backend.operation_policy import GrantAssociation, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, require_allowed
 from backend.opencode_workspace import SELECTOR_RE
 from backend.public_dto import sanitize_task_result
@@ -1203,9 +1204,18 @@ class PostgresTaskService:
             # 用户图片请求的活动排他必须在 TaskRepository 的同图锁内完成；先做
             # 旧的策略冲突预检会把并发活动误报成 generation_policy_conflict。
             self._context_policy_conflict(payload, dedupe)
+        task_max_attempts = (
+            IMAGE_PROCESSING_MAX_ATTEMPTS
+            if image_task_requires_single_attempt(
+                task_type,
+                submission_mode=submission_mode,
+                image_stage=image_stage,
+            )
+            else self.max_attempts
+        )
         with self.resources.environment(self.scope.scope_id) as environment:
             try:
-                record = environment.tasks.submit(task_type=task_type, payload=payload, lane=lane, dedupe_key=dedupe, settings_version=self.settings_version, max_attempts=self.max_attempts, lane_backpressure=_lane_backpressure, lane_backpressure_scope_id=_lane_backpressure_scope, lane_resource_key=_lane_resource_key, submission_mode=submission_mode, image_stage=image_stage, processing_job_id=processing_job_id)
+                record = environment.tasks.submit(task_type=task_type, payload=payload, lane=lane, dedupe_key=dedupe, settings_version=self.settings_version, max_attempts=task_max_attempts, lane_backpressure=_lane_backpressure, lane_backpressure_scope_id=_lane_backpressure_scope, lane_resource_key=_lane_resource_key, submission_mode=submission_mode, image_stage=image_stage, processing_job_id=processing_job_id)
             except DatabaseError as exc:
                 if exc.code == "agent_backpressure":
                     existing = environment.uow.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.task_type == task_type, Task.dedupe_key == dedupe, Task.status.in_(("queued", "running"))))

@@ -147,6 +147,52 @@ def test_image_leaf_runner_inherits_resume_configuration(monkeypatch: pytest.Mon
         worker.shutdown()
 
 
+def test_explicit_image_leaf_uses_single_attempt() -> None:
+    """显式图片叶子 Task 失败后必须由新的用户请求重新创建。"""
+    captured: dict[str, object] = {}
+
+    class _Environment:
+        """捕获 repository 提交参数。"""
+
+        def __init__(self) -> None:
+            self.tasks = SimpleNamespace(submit=self.submit)
+
+        def submit(self, **kwargs: object) -> SimpleNamespace:
+            """记录任务的最大尝试次数。"""
+            captured.update(kwargs)
+            return SimpleNamespace(id="leaf-1")
+
+        def __enter__(self) -> "_Environment":
+            """返回测试环境。"""
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            """退出测试环境。"""
+
+    service = object.__new__(PostgresTaskService)
+    service.scope = ScopeContext("local")
+    service.max_attempts = 4
+    service.settings_version = "settings-test"
+    service.resources = SimpleNamespace(environment=lambda _scope: _Environment())
+    service._record_to_dataclass = lambda record: record
+    service._schedule = lambda _task_id: None
+
+    record = service.submit(
+        "visual_embedding_generation",
+        {
+            "submission_mode": "pipeline",
+            "stage": "visual",
+            "job_id": str(uuid4()),
+            "meme_id": str(uuid4()),
+            "image_sha256": "a" * 64,
+        },
+        schedule=False,
+    )
+
+    assert record.id == "leaf-1"
+    assert captured["max_attempts"] == 1
+
+
 def test_submit_failure_releases_only_uncommitted_grant() -> None:
     """叶子 Task 未创建时才补偿释放已取得的 grant。"""
     tasks = _TaskService(fail_submit=True)
@@ -427,6 +473,23 @@ def test_worker_reuses_existing_planned_leaf_after_restart() -> None:
     assert prepared == []
     assert failures == []
     assert transitions[-1]["status"] == "running"
+
+
+def test_worker_stops_when_existing_leaf_does_not_match_job_target() -> None:
+    """错误绑定到其他图片的叶子 Task 不能推进当前父 Job。"""
+    transitions, failures, prepared = _run_fixed_plan_worker(
+        [
+            {"stage": "visual", "status": "queued", "planned": True, "skip_reason": None, "task_id": "existing-leaf"},
+            {"stage": "agent", "status": "skipped", "planned": False, "skip_reason": "already_ready", "task_id": None},
+            {"stage": "auto_rename", "status": "skipped", "planned": False, "skip_reason": "disabled", "task_id": None},
+            {"stage": "text_embedding", "status": "skipped", "planned": False, "skip_reason": "already_ready", "task_id": None},
+        ],
+        child=SimpleNamespace(status="queued", error=None, payload={}, target_image_sha256="b" * 64),
+        stage_valid=lambda stage: stage != "visual",
+    )
+    assert prepared == []
+    assert transitions == []
+    assert failures and failures[0]["error"] == {"error": "image_processing_plan_stale"}
 
 
 def test_repair_readiness_does_not_trust_succeeded_stage_without_visual_artifact() -> None:

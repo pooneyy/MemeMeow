@@ -370,6 +370,7 @@ class ImageProcessingRepository:
                 config=config,
                 reverse_image_policy=policy,
                 metadata_hash=metadata_hash,
+                auto_name=auto_name_value,
                 readiness=readiness,
             )
             stage_plan = build_stage_plan(processing_mode, auto_name=auto_name_value, readiness=readiness)
@@ -391,6 +392,9 @@ class ImageProcessingRepository:
                 candidate_file_identity = _image_file_identity(meme)
                 session.commit()
             else:
+                # 失败、阻止或未知 Job 的普通处理不能留下全跳过的 queued 计划。
+                if processing_mode == "normal" and not any(planned for planned, _reason in stage_plan.values()):
+                    stage_plan = build_stage_plan("full_retry", auto_name=auto_name_value, readiness=readiness)
                 job = self._new_queued_job(
                     session,
                     meme_uuid=meme_uuid,
@@ -460,6 +464,7 @@ class ImageProcessingRepository:
                 config=config,
                 reverse_image_policy=policy,
                 metadata_hash=metadata_hash,
+                auto_name=auto_name_value,
                 readiness=readiness,
             )
             stage_plan = build_stage_plan(processing_mode, auto_name=auto_name_value, readiness=readiness)
@@ -572,6 +577,7 @@ class ImageProcessingRepository:
             config=config,
             reverse_image_policy=policy,
             metadata_hash=metadata_hash,
+            auto_name=auto_name_value,
             readiness=readiness,
         )
         stage_plan = build_stage_plan(processing_mode, auto_name=auto_name_value, readiness=readiness)
@@ -608,7 +614,9 @@ class ImageProcessingRepository:
             stage_rows = {item.stage: item for item in self._stages(session, job.id)}
             for stage in ("visual", "agent", "text_embedding"):
                 row = stage_rows.get(stage)
-                if row is None or row.status == "succeeded":
+                if row is None:
+                    return False
+                if row.status == "succeeded":
                     continue
                 if row.status != "skipped" or getattr(row, "skip_reason", None) != "already_ready":
                     return False
@@ -724,22 +732,22 @@ class ImageProcessingRepository:
         config: Mapping[str, object] | None = None,
         reverse_image_policy: str | None = None,
         metadata_hash: str | None = None,
+        auto_name: bool | None = None,
         readiness: Mapping[str, bool] | None = None,
     ) -> dict[str, bool]:
         """按当前提交选项和真实产物事实构造创建时的就绪快照。
 
-        ``readiness`` 是调用方在事务外取得的权威快照，主要用于 scope 修复接口，
-        这样文件身份和数据库产物检查不会被旧 Job 阶段状态覆盖。没有快照时，
-        仍在当前短事务内复核数据库中的实际阶段产物；旧阶段显示 succeeded 但产物
-        已被删除时必须返回未就绪。文件和模型等耗时校验仍由事务外的调用方负责。
+        ``readiness`` 是调用方在事务外取得的候选快照。提交事务内仍须核对当前
+        数据库产物，防止图片在枚举和创建 Job 之间已经变化。
         """
+        supplied_readiness: dict[str, bool] | None = None
         if readiness is not None:
-            return {
+            supplied_readiness = {
                 stage: type(readiness.get(stage, False)) is bool and readiness.get(stage, False)
                 for stage in STAGES
             }
         if job is None:
-            return {stage: False for stage in STAGES}
+            return supplied_readiness or {stage: False for stage in STAGES}
         rows = session.scalars(
             select(ImageProcessingStage).where(
                 ImageProcessingStage.scope_id == getattr(job, "scope_id", None),
@@ -838,6 +846,18 @@ class ImageProcessingRepository:
                 )
             )
         stage_readiness["text_embedding"] = stage_readiness["text_embedding"] and text_row is not None
+        if supplied_readiness is not None:
+            current_ready = all(stage_readiness[stage] for stage in ("visual", "agent", "text_embedding")) and (
+                auto_name is False
+                or (auto_name is True and stage_readiness["auto_rename"])
+                or (auto_name is None and supplied_readiness["auto_rename"] and stage_readiness["auto_rename"])
+            )
+            if current_ready:
+                return stage_readiness
+            return {
+                stage: supplied_readiness[stage] and stage_readiness[stage]
+                for stage in STAGES
+            }
         return stage_readiness
 
     def _new_queued_job(
@@ -2074,6 +2094,14 @@ class ImageProcessingWorker:
                     logger.info("image_processing_task_create_failed job=%s stage=%s error=%s", job.id, name, type(exc).__name__)
                     return
                 child = self.tasks.get(str(task_id)) if callable(getattr(self.tasks, "get", None)) else None
+            if child is not None and not self._child_task_matches(job, name, child):
+                self.jobs.fail_job(
+                    job.id,
+                    owner=self.owner,
+                    claim_generation=job.claim_generation,
+                    error={"error": "image_processing_plan_stale"},
+                )
+                return
             if child is not None and child.status == "succeeded":
                 if not self._skipped_plan_valid(job, snapshot.stages):
                     self.jobs.fail_job(job.id, owner=self.owner, claim_generation=job.claim_generation, error={"error": "image_processing_plan_stale"})
@@ -2171,6 +2199,42 @@ class ImageProcessingWorker:
                 logger.info("image_processing_plan_validation_failed job=%s stage=%s error=%s", getattr(job, "id", None), item.get("stage"), type(exc).__name__)
                 return False
         return True
+
+    @staticmethod
+    def _child_task_matches(job: ImageProcessingJob, stage: str, child: object) -> bool:
+        """确认已关联叶子 Task 仍属于当前 Job、阶段和图片输入。"""
+        expected_type = STAGE_TASK_TYPES.get(stage)
+        if expected_type is None or getattr(child, "task_type", expected_type) != expected_type:
+            return False
+        if getattr(child, "submission_mode", None) not in {None, "pipeline"}:
+            return False
+        if getattr(child, "processing_job_id", None) not in {None, job.id, str(job.id)}:
+            return False
+        if getattr(child, "image_stage", None) not in {None, stage}:
+            return False
+        if getattr(child, "target_meme_id", None) not in {None, job.meme_id, str(job.meme_id)}:
+            return False
+        target_sha256 = getattr(child, "target_image_sha256", None)
+        if target_sha256 is not None and str(target_sha256).lower() != str(job.image_sha256).lower():
+            return False
+        payload = getattr(child, "payload", None)
+        if not isinstance(payload, Mapping):
+            payload = {}
+        if payload.get("submission_mode") not in {None, "pipeline"}:
+            return False
+        if payload.get("job_id") not in {None, str(job.id)} or payload.get("stage") not in {None, stage}:
+            return False
+        if payload.get("meme_id") not in {None, str(job.meme_id)}:
+            return False
+        if payload.get("image_sha256") is not None and str(payload["image_sha256"]).lower() != str(job.image_sha256).lower():
+            return False
+        if payload.get("processing_config_hash") not in {None, getattr(job, "processing_config_hash", None)}:
+            return False
+        try:
+            expected_policy = normalize_reverse_image_policy(job.reverse_image_policy)
+        except ImageProcessingError:
+            return False
+        return payload.get("reverse_image_policy") in {None, expected_policy}
 
     def _refresh_metadata_hash(self, job: ImageProcessingJob) -> None:
         """把当前 Meme 语境指纹写回 job，避免 Agent 成功后沿用旧 hash。"""

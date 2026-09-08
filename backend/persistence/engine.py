@@ -25,7 +25,7 @@ from backend.persistence.models import (
 
 SCOPE_LOCAL = "local"
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0023_image_processing_fixed_plans"
+CURRENT_SCHEMA_REVISION = "0024_image_processing_retry_hardening"
 
 
 class DatabaseError(RuntimeError):
@@ -134,10 +134,18 @@ def ensure_optional_control_schema(engine: Engine) -> None:
             """))
             unresolved = connection.execute(text("""
                 SELECT count(*)
-                  FROM tasks
-                 WHERE task_type IN ('visual_embedding_generation','meme_context_generation','image_auto_rename','text_embedding_generation')
-                   AND status IN ('queued','running')
-                   AND (target_meme_id IS NULL OR target_image_sha256 IS NULL)
+                  FROM tasks AS task
+                  LEFT JOIN memes AS meme
+                    ON meme.scope_id = task.scope_id
+                   AND meme.id = task.target_meme_id
+                 WHERE task.task_type IN ('visual_embedding_generation','meme_context_generation','image_auto_rename','text_embedding_generation')
+                   AND task.status IN ('queued','running')
+                   AND (
+                        task.target_meme_id IS NULL
+                        OR task.target_image_sha256 IS NULL
+                        OR meme.id IS NULL
+                        OR lower(meme.sha256) <> lower(task.target_image_sha256)
+                   )
             """)).scalar_one()
             if int(unresolved or 0) > 0:
                 raise DatabaseError("image_processing_history_unresolved")

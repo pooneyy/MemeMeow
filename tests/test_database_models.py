@@ -20,7 +20,7 @@ from backend.persistence import models
 def test_single_forward_migration_head():
     """仓库只暴露一个前向 revision head，回滚由 migration 明确拒绝。"""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["0023_image_processing_fixed_plans"]
+    assert script.get_heads() == ["0024_image_processing_retry_hardening"]
     assert (Path("alembic/versions/0001_postgres_scoped.py")).is_file()
 
 
@@ -48,6 +48,16 @@ def test_image_processing_fixed_plan_migration_is_forward_only_and_fail_closed_o
     assert "target_meme_id" in migration and "target_image_sha256" in migration
     assert "image_processing_history_unresolved" in migration
     assert "ix_tasks_image_target_active" in migration
+    assert "raise RuntimeError" in migration
+
+
+def test_image_processing_retry_hardening_checks_active_task_target_identity():
+    """0024 必须接在固定计划迁移后，并拒绝 SHA 已变化的活动历史 Task。"""
+    migration = Path("alembic/versions/0024_image_processing_retry_hardening.py").read_text(encoding="utf-8")
+    assert 'down_revision = "0023_image_processing_fixed_plans"' in migration
+    assert "LEFT JOIN memes AS meme" in migration
+    assert "lower(meme.sha256) <> lower(task.target_image_sha256)" in migration
+    assert "image_processing_history_unresolved" in migration
     assert "raise RuntimeError" in migration
 
 
