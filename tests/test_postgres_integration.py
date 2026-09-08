@@ -51,12 +51,13 @@ from backend.database import (
     ImageProcessingStage,
     OperationGrant,
     SearchMigrationState,
+    MemeTextEmbedding,
     utcnow,
     create_engine_for_url,
 )
 from backend.config import Settings
 from backend.image_processing import ImageProcessingError, ImageProcessingRepository, ImageProcessingWorker, STAGES
-from backend.metadata import MetadataError, MemeContext
+from backend.metadata import MetadataError, MemeContext, semantic_document, semantic_document_hash
 from backend.operation_policy import AllowAllOperationPolicy, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, PersistentGrantAssociationStore
 from backend.visual import VisualSearchError, VisualSearchService
 from backend.scope import ScopeServiceFactory
@@ -149,8 +150,8 @@ def test_postgres_composite_scope_foreign_keys_reject_mixed_scope_rows(postgres_
     suffix = uuid4().hex
     scope_a = Scope(id=f"test-a-{suffix}")
     scope_b = Scope(id=f"test-b-{suffix}")
-    meme_a = Meme(scope_id=scope_a.id, storage_key="same.png", extension=".png", size_bytes=1, sha256="a" * 64, meme_context={}, provenance={}, extensions={})
-    meme_b = Meme(scope_id=scope_b.id, storage_key="same.png", extension=".png", size_bytes=1, sha256="b" * 64, meme_context={}, provenance={}, extensions={})
+    meme_a = Meme(scope_id=scope_a.id, storage_key="a" * 64 + ".png", extension=".png", size_bytes=1, sha256="a" * 64, meme_context={}, provenance={}, extensions={})
+    meme_b = Meme(scope_id=scope_b.id, storage_key="b" * 64 + ".png", extension=".png", size_bytes=1, sha256="b" * 64, meme_context={}, provenance={}, extensions={})
     generation_a = SearchGeneration(scope_id=scope_a.id, model="test-model", source_snapshot_hash="a" * 64)
     generation_b = SearchGeneration(scope_id=scope_b.id, model="test-model", source_snapshot_hash="b" * 64)
     batch_a = TaskBatch(scope_id=scope_a.id, batch_id=f"batch-a-{suffix}")
@@ -463,6 +464,90 @@ def test_image_processing_repository_enforces_stage_order_claim_fencing_and_retr
     assert retried.auto_name is True
 
 
+def test_image_processing_user_modes_share_one_picture_exclusion(postgres_resources) -> None:
+    """父 Job 和独立阶段 Task 不能在同一张图片上并行建立活动执行。"""
+    resources = postgres_resources
+    meme = StorageCoordinator(resources).upload(
+        b"shared-picture-exclusion",
+        target_key="shared-picture-exclusion.png",
+        extension=".png",
+        context={},
+        provenance={},
+    )
+    repository = ImageProcessingRepository(resources, "local")
+    repository.create_or_reuse(meme.id, meme.sha256, processing_mode="full_retry")
+
+    worker = ImageProcessingWorker(
+        resources,
+        scope_id="local",
+        task_service=PostgresTaskService(resources, scope_id="local", finalize_image_tasks=False),
+    )
+    try:
+        with pytest.raises(ImageProcessingError, match="image_processing_active"):
+            worker.submit_stage(meme.id, "visual", schedule=False)
+    finally:
+        worker.shutdown()
+
+    standalone_meme = StorageCoordinator(resources).upload(
+        b"shared-picture-standalone",
+        target_key="shared-picture-standalone.png",
+        extension=".png",
+        context={},
+        provenance={},
+    )
+    with resources.environment("local") as environment:
+        task = environment.tasks.submit(
+            task_type="image_auto_rename",
+            payload={
+                "_user_image_submission": True,
+                "submission_mode": "standalone",
+                "stage": "auto_rename",
+                "meme_id": str(standalone_meme.id),
+                "image_sha256": standalone_meme.sha256,
+            },
+            submission_mode="standalone",
+            image_stage="auto_rename",
+            dedupe_key="shared-picture-standalone",
+        )
+        assert task.target_meme_id == standalone_meme.id
+        assert task.target_image_sha256 == standalone_meme.sha256
+
+    with pytest.raises(ImageProcessingError, match="image_processing_active"):
+        repository.create_or_reuse(standalone_meme.id, standalone_meme.sha256, processing_mode="full_retry")
+
+
+def test_concurrent_full_retry_creates_one_revision_and_one_conflict(postgres_resources) -> None:
+    """两个并发完整重试只允许一个请求创建父 Job。"""
+    resources = postgres_resources
+    meme = StorageCoordinator(resources).upload(
+        b"concurrent-full-retry",
+        target_key="concurrent-full-retry.png",
+        extension=".png",
+        context={},
+        provenance={},
+    )
+
+    def submit() -> str:
+        """提交一次完整重试并返回成功或稳定冲突码。"""
+        try:
+            ImageProcessingRepository(resources, "local").create_or_reuse(
+                meme.id,
+                meme.sha256,
+                processing_mode="full_retry",
+            )
+        except ImageProcessingError as exc:
+            return exc.code
+        return "submitted"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [future.result(timeout=10) for future in [executor.submit(submit), executor.submit(submit)]]
+
+    assert sorted(results) == ["image_processing_active", "submitted"]
+    with resources.factory() as session:
+        jobs = list(session.scalars(select(ImageProcessingJob).where(ImageProcessingJob.scope_id == "local", ImageProcessingJob.meme_id == meme.id)))
+    assert len(jobs) == 1
+
+
 def test_image_processing_warning_does_not_pollute_successful_job_error(postgres_resources) -> None:
     """自动命名 warning 保留阶段错误，但父 Job 成功时顶层 error 必须为空。"""
     repository = ImageProcessingRepository(postgres_resources, "local")
@@ -669,10 +754,10 @@ def test_auto_rename_same_name_still_checks_claim_without_storage_operation(post
         b"same-name-target",
         target_key="same-name.png",
         extension=".png",
-        context={"title": "same-name"},
+        context={"title": "same name"},
         provenance={},
     )
-    title_fingerprint = hashlib.sha256(b"same-name").hexdigest()
+    title_fingerprint = hashlib.sha256(b"same name").hexdigest()
     with resources.environment("local") as environment:
         task = environment.tasks.submit(
             task_type="image_auto_rename",
@@ -689,7 +774,7 @@ def test_auto_rename_same_name_still_checks_claim_without_storage_operation(post
     result = coordinator.rename_if_current(
         meme.id,
         target_key="same-name.png",
-        expected_source_key="same-name.png",
+        expected_source_key=meme.storage_key,
         expected_sha256=meme.sha256,
         expected_revision=before_revision,
         task_id=claim.id,
@@ -698,7 +783,7 @@ def test_auto_rename_same_name_still_checks_claim_without_storage_operation(post
         claim_owner="same-name-owner",
         expected_title_fingerprint=title_fingerprint,
     )
-    assert result.storage_key == "same-name.png"
+    assert result.storage_key == meme.storage_key
     assert result.revision == before_revision
     with resources.factory() as session:
         operations = list(
@@ -713,12 +798,12 @@ def test_auto_rename_same_name_still_checks_claim_without_storage_operation(post
     assert operations[0].operation_type == "upload"
 
     # 即使目标文件名已经相同，也必须确认文件字节仍是当前 Meme 的身份。
-    resources.blob_store.resolve("same-name.png").write_bytes(b"same-name-mutated")
+    resources.blob_store.resolve(meme.storage_key).write_bytes(b"same-name-mutated")
     with pytest.raises(DatabaseError, match="target_changed"):
         coordinator.rename_if_current(
             meme.id,
             target_key="same-name.png",
-            expected_source_key="same-name.png",
+            expected_source_key=meme.storage_key,
             expected_sha256=meme.sha256,
             expected_revision=before_revision,
             task_id=claim.id,
@@ -741,7 +826,7 @@ def test_auto_rename_same_name_still_checks_claim_without_storage_operation(post
         coordinator.rename_if_current(
             meme.id,
             target_key="same-name.png",
-            expected_source_key="same-name.png",
+            expected_source_key=meme.storage_key,
             expected_sha256=meme.sha256,
             expected_revision=before_revision,
             task_id=claim.id,
@@ -760,10 +845,10 @@ def test_auto_rename_same_name_fails_closed_for_blocked_storage_operation(postgr
         b"blocked-same-name",
         target_key="blocked-same-name.png",
         extension=".png",
-        context={"title": "blocked-same-name"},
+        context={"title": "blocked same name"},
         provenance={},
     )
-    title_fingerprint = hashlib.sha256(b"blocked-same-name").hexdigest()
+    title_fingerprint = hashlib.sha256(b"blocked same name").hexdigest()
     with resources.environment("local") as environment:
         task = environment.tasks.submit(
             task_type="image_auto_rename",
@@ -795,7 +880,7 @@ def test_auto_rename_same_name_fails_closed_for_blocked_storage_operation(postgr
     with pytest.raises(DatabaseError, match="storage_operation_unknown"):
         coordinator.rename_if_current(
             meme.id,
-            target_key=meme.storage_key,
+            target_key="blocked-same-name.png",
             expected_source_key=meme.storage_key,
             expected_sha256=meme.sha256,
             expected_revision=meme.revision,
@@ -815,7 +900,7 @@ def test_auto_rename_file_move_error_is_unknown_and_blocked(postgres_resources, 
         b"move-error",
         target_key="move-error-source.png",
         extension=".png",
-        context={"title": "move-error-target"},
+        context={"title": "move error target"},
         provenance={},
     )
     with resources.environment("local") as environment:
@@ -835,29 +920,20 @@ def test_auto_rename_file_move_error_is_unknown_and_blocked(postgres_resources, 
         raise DatabaseError("file_move_failed")
 
     monkeypatch.setattr(resources.blob_store, "link_move", fail_move)
-    with pytest.raises(DatabaseError, match="storage_operation_unknown"):
-        coordinator.rename_if_current(
-            meme.id,
-            target_key="move-error-target.png",
-            expected_source_key=meme.storage_key,
-            expected_sha256=meme.sha256,
-            expected_revision=meme.revision,
-            task_id=claim.id,
-            claim_generation=claim.claim_generation,
-            attempt=claim.attempt_count,
-            claim_owner="move-error-owner",
-            expected_title_fingerprint=hashlib.sha256(b"move-error-target").hexdigest(),
-        )
-    with resources.factory() as session:
-        operation = session.scalar(
-            select(StorageOperation).where(
-                StorageOperation.scope_id == "local",
-                StorageOperation.meme_id == meme.id,
-                StorageOperation.operation_type == "rename",
-            )
-        )
-        assert operation is not None
-        assert operation.status == "blocked"
+    result = coordinator.rename_if_current(
+        meme.id,
+        target_key="move-error-target.png",
+        expected_source_key=meme.storage_key,
+        expected_sha256=meme.sha256,
+        expected_revision=meme.revision,
+        task_id=claim.id,
+        claim_generation=claim.claim_generation,
+        attempt=claim.attempt_count,
+        claim_owner="move-error-owner",
+        expected_title_fingerprint=hashlib.sha256(b"move error target").hexdigest(),
+    )
+    assert result.storage_key == meme.storage_key
+    assert result.display_name == "move-error-target"
 
 
 def test_image_worker_rejects_stage_reuse_after_file_bytes_change(postgres_resources) -> None:
@@ -928,6 +1004,7 @@ def test_storage_cas_rename_preserves_manual_winner_conflict_and_claim_fencing(p
                     "image_sha256": meme.sha256,
                     "expected_storage_key": meme.storage_key,
                     "expected_meme_revision": meme.revision,
+                    "expected_display_name": meme.display_name,
                     "title_fingerprint": hashlib.sha256(title.encode()).hexdigest(),
                 },
                 lane="default",
@@ -942,11 +1019,11 @@ def test_storage_cas_rename_preserves_manual_winner_conflict_and_claim_fencing(p
     manual = coordinator.upload(b"manual-winner", target_key="manual-source.png", extension=".png", context={"title": "Manual winner"}, provenance={})
     manual_claim = claimed_task(manual, owner="cas-manual", dedupe="cas-manual")
     coordinator.rename(manual.id, target_key="manual-winner.png")
-    with pytest.raises(DatabaseError, match="storage_key_changed"):
+    with pytest.raises(DatabaseError, match="display_name_changed"):
         coordinator.rename_if_current(
             manual.id,
             target_key="Derived manual.png",
-            expected_source_key="manual-source.png",
+            expected_source_key=manual.storage_key,
             expected_sha256=manual.sha256,
             expected_revision=1,
             task_id=manual_claim.id,
@@ -954,28 +1031,28 @@ def test_storage_cas_rename_preserves_manual_winner_conflict_and_claim_fencing(p
             attempt=manual_claim.attempt_count,
             claim_owner="cas-manual",
             expected_title_fingerprint=hashlib.sha256(b"Manual winner").hexdigest(),
+            expected_display_name=manual.display_name,
         )
-    assert resources.blob_store.resolve("manual-winner.png").exists()
-    assert not resources.blob_store.resolve("Derived manual.png", must_exist=False).exists()
+    assert resources.blob_store.resolve(manual.storage_key).exists()
 
     conflict = coordinator.upload(b"conflict-target", target_key="conflict-source.png", extension=".png", context={"title": "Conflict target"}, provenance={})
     occupied = coordinator.upload(b"occupied-target", target_key="Conflict target.png", extension=".png", context={}, provenance={})
     conflict_claim = claimed_task(conflict, owner="cas-conflict", dedupe="cas-conflict")
-    with pytest.raises(DatabaseError, match="target_exists"):
-        coordinator.rename_if_current(
-            conflict.id,
-            target_key="Conflict target.png",
-            expected_source_key="conflict-source.png",
-            expected_sha256=conflict.sha256,
-            expected_revision=1,
-            task_id=conflict_claim.id,
-            claim_generation=conflict_claim.claim_generation,
-            attempt=conflict_claim.attempt_count,
-            claim_owner="cas-conflict",
-            expected_title_fingerprint=hashlib.sha256(b"Conflict target").hexdigest(),
-        )
-    assert resources.blob_store.resolve("conflict-source.png").exists()
-    assert resources.blob_store.resolve("Conflict target.png").exists()
+    renamed_conflict = coordinator.rename_if_current(
+        conflict.id,
+        target_key="Conflict target.png",
+        expected_source_key=conflict.storage_key,
+        expected_sha256=conflict.sha256,
+        expected_revision=1,
+        task_id=conflict_claim.id,
+        claim_generation=conflict_claim.claim_generation,
+        attempt=conflict_claim.attempt_count,
+        claim_owner="cas-conflict",
+        expected_title_fingerprint=hashlib.sha256(b"Conflict target").hexdigest(),
+    )
+    assert renamed_conflict.display_name == "Conflict target"
+    assert resources.blob_store.resolve(conflict.storage_key).exists()
+    assert resources.blob_store.resolve(occupied.storage_key).exists()
     assert occupied.id != conflict.id
 
     fenced = coordinator.upload(b"fenced-target", target_key="fenced-source.png", extension=".png", context={"title": "Fenced target"}, provenance={})
@@ -984,7 +1061,7 @@ def test_storage_cas_rename_preserves_manual_winner_conflict_and_claim_fencing(p
         coordinator.rename_if_current(
             fenced.id,
             target_key="Fenced target.png",
-            expected_source_key="fenced-source.png",
+            expected_source_key=fenced.storage_key,
             expected_sha256=fenced.sha256,
             expected_revision=1,
             task_id=fenced_claim.id,
@@ -993,8 +1070,8 @@ def test_storage_cas_rename_preserves_manual_winner_conflict_and_claim_fencing(p
             claim_owner="wrong-owner",
             expected_title_fingerprint=hashlib.sha256(b"Fenced target").hexdigest(),
         )
-    assert resources.blob_store.resolve("fenced-source.png").exists()
-    assert not resources.blob_store.resolve("Fenced target.png", must_exist=False).exists()
+    assert resources.blob_store.resolve(fenced.storage_key).exists()
+    assert resources.blob_store.resolve(fenced.storage_key).read_bytes() == b"fenced-target"
 
 
 def test_storage_recovery_blocks_auto_rename_after_claim_lease_expires(postgres_resources) -> None:
@@ -1055,8 +1132,7 @@ def test_storage_recovery_blocks_auto_rename_after_claim_lease_expires(postgres_
 
     counts = coordinator.recover()
     assert counts["blocked"] == 1
-    assert resources.blob_store.resolve("recovery-source.png").exists()
-    assert not resources.blob_store.resolve("Recovery claim.png", must_exist=False).exists()
+    assert resources.blob_store.resolve(meme.storage_key).exists()
     with resources.factory() as session:
         operation = session.scalar(
             select(StorageOperation).where(
@@ -1108,7 +1184,7 @@ def test_image_worker_agent_dedupes_before_acquire_and_persists_one_trusted_gran
 
     def create_job(storage_key: str):
         """创建一张仅用于测试单 scope Worker 准备路径的图片 job。"""
-        meme = StorageCoordinator(resources).upload(b"agent-worker-target", target_key=storage_key, extension=".png", context={}, provenance={})
+        meme = StorageCoordinator(resources).upload(f"agent-worker-target:{storage_key}".encode(), target_key=storage_key, extension=".png", context={}, provenance={})
         return meme, repository.create_or_reuse(meme.id, meme.sha256, config=config, reverse_image_policy="forbid")
 
     def advance_visual(job) -> None:
@@ -1220,17 +1296,42 @@ def test_image_worker_agent_dedupes_before_acquire_and_persists_one_trusted_gran
 def test_search_migration_state_uses_single_epoch_and_atomic_switch(postgres_resources) -> None:
     """增量回填只接受当前 epoch，完成后才切换唯一查询来源。"""
     resources = postgres_resources
+    coordinator = StorageCoordinator(resources)
+    memes = [
+        coordinator.upload(b"migration-one", target_key="migration-one.png", extension=".png", context={"title": "migration one"}, provenance={}, status="ready"),
+        coordinator.upload(b"migration-two", target_key="migration-two.png", extension=".png", context={"title": "migration two"}, provenance={}, status="ready"),
+    ]
     with resources.environment("local") as environment:
         state = environment.search.begin_incremental_backfill("migration-test", total_count=2)
         epoch = state.epoch
         assert state.mode == "backfill"
+        for meme in memes:
+            row = environment.memes.get(meme.id)
+            assert row is not None
+            context = MemeContext.model_validate(row.meme_context)
+            document = semantic_document(context)
+            metadata_hash = semantic_document_hash(context)
+            assert metadata_hash is not None
+            environment.uow.session.add(
+                MemeTextEmbedding(
+                    scope_id="local",
+                    meme_id=row.id,
+                    image_sha256=row.sha256,
+                    metadata_hash=metadata_hash,
+                    embedding_model_version="migration-test",
+                    dimensions=EMBEDDING_DIMENSIONS,
+                    semantic_document=document,
+                    embedding=[1.0] + [0.0] * (EMBEDDING_DIMENSIONS - 1),
+                    status="ready",
+                )
+            )
         assert environment.search.record_incremental_backfill(epoch=epoch - 1, completed_count=1, model="migration-test") is False
         assert environment.search.record_incremental_backfill(epoch=epoch, completed_count=1, model="migration-test") is True
         assert environment.search.switch_incremental_only(epoch=epoch, model="migration-test") is False
         assert environment.search.record_incremental_backfill(epoch=epoch, completed_count=2, model="migration-test") is True
         assert environment.search.switch_incremental_only(epoch=epoch, model="migration-test") is True
         assert environment.search.source_mode("migration-test") == "incremental"
-        assert environment.search.source_mode("other-model") == "legacy"
+        assert environment.search.source_mode("other-model") == "not_ready"
 
 
 def _clean_business_rows(engine: Engine) -> None:
@@ -1252,13 +1353,55 @@ def postgres_resources(postgres_engine: Engine, tmp_path: Path):
         _clean_business_rows(postgres_engine)
 
 
+def test_concurrent_same_content_uploads_converge_after_file_commit(postgres_resources, monkeypatch: pytest.MonkeyPatch) -> None:
+    """同一 scope 的并发同内容上传必须等待文件落位并复用同一 Meme。"""
+    resources = postgres_resources
+    first = StorageCoordinator(resources)
+    second = StorageCoordinator(resources)
+    entered_move = threading.Event()
+    release_move = threading.Event()
+    original_move = resources.blob_store.link_move
+
+    def delayed_move(source_key: str, target_key: str) -> None:
+        """把首个上传停在 operation 提交后，稳定覆盖重复请求窗口。"""
+        entered_move.set()
+        if not release_move.wait(timeout=10):
+            raise RuntimeError("test_file_move_timeout")
+        original_move(source_key, target_key)
+
+    monkeypatch.setattr(resources.blob_store, "link_move", delayed_move)
+    payload = b"concurrent-content-identity"
+    arguments = {
+        "target_key": "first-name.png",
+        "extension": ".png",
+        "context": {},
+        "provenance": {},
+    }
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(first.upload, payload, **arguments)
+        assert entered_move.wait(timeout=10)
+        second_future = executor.submit(second.upload, payload, target_key="second-name.png", extension=".png", context={}, provenance={})
+        release_move.set()
+        first_result = first_future.result(timeout=10)
+        second_result = second_future.result(timeout=10)
+
+    assert first_result.id == second_result.id
+    assert first_result.storage_key == f"{hashlib.sha256(payload).hexdigest()}.png"
+    assert first_result.display_name == "first-name"
+    assert resources.blob_store.resolve(first_result.storage_key).read_bytes() == payload
+    with resources.factory() as session:
+        assert session.scalar(select(func.count()).select_from(Meme).where(Meme.scope_id == "local")) == 1
+        assert session.scalar(select(func.count()).select_from(StorageOperation).where(StorageOperation.scope_id == "local")) == 1
+
+
 def test_storage_recovery_and_two_scope_namespaces(postgres_resources, postgres_engine: Engine, tmp_path: Path) -> None:
     """验证上传暂存恢复、双 scope 同名路径物理隔离且数据库互不可见。"""
     resources = postgres_resources
     coordinator = StorageCoordinator(resources)
     payload = b"storage-recovery"
     meme = coordinator.upload(payload, target_key="same.png", extension=".png", context={}, provenance={})
-    assert resources.blob_store.resolve("same.png").read_bytes() == payload
+    assert meme.display_name == "same"
+    assert resources.blob_store.resolve(meme.storage_key).read_bytes() == payload
     with resources.factory() as session:
         operation = session.scalar(select(StorageOperation).where(StorageOperation.meme_id == meme.id))
         assert operation is not None and operation.status == "completed"
@@ -1267,11 +1410,12 @@ def test_storage_recovery_and_two_scope_namespaces(postgres_resources, postgres_
         connection.execute(text("INSERT INTO scopes(id, storage_namespace, created_at) VALUES (:id, :namespace, now())"), {"id": f"isolated-{suffix}", "namespace": uuid4()})
     isolated = resources.blob_store_for_scope(f"isolated-{suffix}")
     assert isolated.root != resources.blob_store.root
-    assert not isolated.resolve("same.png", must_exist=False).exists()
+    assert not isolated.resolve(meme.storage_key, must_exist=False).exists()
     isolated_coordinator = StorageCoordinator(resources, scope_id=f"isolated-{suffix}")
-    isolated_coordinator.upload(payload, target_key="same.png", extension=".png", context={}, provenance={})
-    assert isolated.resolve("same.png").read_bytes() == payload
-    assert resources.blob_store.resolve("same.png").read_bytes() == payload
+    isolated_meme = isolated_coordinator.upload(payload, target_key="same.png", extension=".png", context={}, provenance={})
+    assert isolated_meme.display_name == "same"
+    assert isolated.resolve(isolated_meme.storage_key).read_bytes() == payload
+    assert resources.blob_store.resolve(meme.storage_key).read_bytes() == payload
     with resources.environment("local") as environment:
         assert len(environment.memes.list()) == 1
     with resources.environment(f"isolated-{suffix}") as environment:
@@ -1286,6 +1430,7 @@ def test_storage_recovery_removes_meme_after_file_applied_before_delete_commit(p
     coordinator = StorageCoordinator(resources)
     source_key = f"delete-recovery-{uuid4().hex}.png"
     meme = coordinator.upload(b"delete-recovery", target_key=source_key, extension=".png", context={}, provenance={})
+    source_key = meme.storage_key
     thumbnail_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.jpg"
     thumbnail_store = resources.thumbnail_store_for_scope("local")
     thumbnail_content = b"derived"
@@ -1345,13 +1490,16 @@ def test_storage_recovery_does_not_delete_changed_meme_after_prepared_quarantine
     coordinator = StorageCoordinator(resources)
     source_key = f"prepared-delete-changed-{uuid4().hex}.png"
     meme = coordinator.upload(b"prepared-delete-changed", target_key=source_key, extension=".png", context={}, provenance={})
+    source_key = meme.storage_key
     token = uuid4()
     quarantine_key = resources.blob_store.quarantine(source_key, token=token)
-    changed_key = f"prepared-delete-replacement-{uuid4().hex}.png"
+    changed_sha256 = "f" * 64
+    changed_key = f"{changed_sha256}.png"
     with resources.factory() as session:
         record = session.get(Meme, meme.id)
         assert record is not None
         record.storage_key = changed_key
+        record.sha256 = changed_sha256
         record.revision += 1
         session.add(
             StorageOperation(
@@ -1426,6 +1574,7 @@ def test_storage_delete_collects_thumbnail_written_after_initial_snapshot(postgr
     coordinator = StorageCoordinator(resources)
     source_key = f"thumbnail-delete-window-{uuid4().hex}.png"
     meme = coordinator.upload(b"delete-window", target_key=source_key, extension=".png", context={}, provenance={})
+    source_key = meme.storage_key
     thumbnail_store = resources.thumbnail_store_for_scope("local")
     output = b"late-derived"
     output_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.jpg"
@@ -1461,6 +1610,7 @@ def test_storage_recovery_collects_unregistered_thumbnail_output(postgres_resour
     coordinator = StorageCoordinator(resources)
     source_key = f"thumbnail-recovery-window-{uuid4().hex}.png"
     meme = coordinator.upload(b"recovery-window", target_key=source_key, extension=".png", context={}, provenance={})
+    source_key = meme.storage_key
     thumbnail_store = resources.thumbnail_store_for_scope("local")
     output = b"unregistered-derived"
     output_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.jpg"
@@ -1494,6 +1644,7 @@ def test_storage_recovery_uses_delete_marker_after_meme_detached(postgres_resour
     coordinator = StorageCoordinator(resources)
     source_key = f"thumbnail-marker-recovery-{uuid4().hex}.png"
     meme = coordinator.upload(b"marker-recovery", target_key=source_key, extension=".png", context={}, provenance={})
+    source_key = meme.storage_key
     thumbnail_store = resources.thumbnail_store_for_scope("local")
     output = b"marker-derived"
     output_key = f"{meme.id.hex}-{meme.sha256}-thumbnail-v1.jpg"
@@ -1539,6 +1690,7 @@ def test_storage_recovery_keeps_delete_active_when_thumbnail_scan_is_unavailable
     coordinator = StorageCoordinator(resources)
     source_key = f"thumbnail-scan-unavailable-{uuid4().hex}.png"
     meme = coordinator.upload(b"scan-unavailable", target_key=source_key, extension=".png", context={}, provenance={})
+    source_key = meme.storage_key
     token = uuid4()
     quarantine_key = resources.blob_store.quarantine(source_key, token=token)
     with resources.factory() as session:
@@ -1588,6 +1740,7 @@ def test_storage_delete_keeps_recoverable_fact_when_final_thumbnail_scan_fails(p
     coordinator = StorageCoordinator(resources)
     source_key = f"thumbnail-final-scan-failure-{uuid4().hex}.png"
     meme = coordinator.upload(b"final-scan-failure", target_key=source_key, extension=".png", context={}, provenance={})
+    source_key = meme.storage_key
     original_scan = coordinator._thumbnail_file_keys
     calls = 0
 
@@ -1618,6 +1771,7 @@ def test_storage_delete_database_cleanup_failure_is_recoverable(postgres_resourc
     coordinator = StorageCoordinator(resources)
     source_key = f"thumbnail-cleanup-db-failure-{uuid4().hex}.png"
     meme = coordinator.upload(b"cleanup-db-failure", target_key=source_key, extension=".png", context={}, provenance={})
+    source_key = meme.storage_key
 
     def fail_cleanup(_keys: list[str]) -> list[str]:
         """模拟文件清理阶段的数据库/存储协调异常。"""
@@ -1644,7 +1798,7 @@ def test_collection_export_query_is_ordered_and_excludes_active_storage_operatio
         collection = environment.collections.create("导出查询")
         environment.collections.add_members(collection.id, [first.id, second.id])
     with postgres_resources.factory() as session:
-        session.add(StorageOperation(scope_id="local", meme_id=second.id, operation_type="rename", operation_token=uuid4(), source_key="second.png", target_key="second-new.png", before_sha256=second.sha256, after_sha256=second.sha256, before_size=second.size_bytes, after_size=second.size_bytes, status="prepared"))
+        session.add(StorageOperation(scope_id="local", meme_id=second.id, operation_type="rename", operation_token=uuid4(), source_key=second.storage_key, target_key="second-new.png", before_sha256=second.sha256, after_sha256=second.sha256, before_size=second.size_bytes, after_size=second.size_bytes, status="prepared"))
         session.commit()
     with postgres_resources.environment("local") as environment:
         exported = environment.collections.members_for_export(collection.id)
@@ -2277,14 +2431,14 @@ def test_generation_activation_rejects_new_indexable_source(postgres_resources) 
     from backend.database import Meme, SearchGeneration
 
     with postgres_resources.environment("local") as environment:
-        first = Meme(scope_id="local", storage_key="first.png", extension=".png", size_bytes=1, sha256="1" * 64, context_status="ready", meme_context={"title": "first", "summary": "x"}, provenance={}, extensions={})
+        first = Meme(scope_id="local", storage_key="1" * 64 + ".png", extension=".png", size_bytes=1, sha256="1" * 64, context_status="ready", meme_context={"title": "first", "summary": "x"}, provenance={}, extensions={})
         environment.uow.session.add(first)
         environment.uow.session.flush()
         generation = environment.search.create_generation("test", "a" * 64)
         environment.search.add_snapshot_item(generation.id, meme_id=first.id, meme_revision=first.revision, image_sha256=first.sha256, semantic_document="标题：first", metadata_hash="b" * 64)
         environment.search.set_item_embedding(generation.id, first.id, [1.0] + [0.0] * 1023)
     with postgres_resources.environment("local") as environment:
-        second = Meme(scope_id="local", storage_key="second.png", extension=".png", size_bytes=1, sha256="2" * 64, context_status="ready", meme_context={"title": "second", "summary": "x"}, provenance={}, extensions={})
+        second = Meme(scope_id="local", storage_key="2" * 64 + ".png", extension=".png", size_bytes=1, sha256="2" * 64, context_status="ready", meme_context={"title": "second", "summary": "x"}, provenance={}, extensions={})
         environment.uow.session.add(second)
     with postgres_resources.environment("local") as environment:
         with pytest.raises(Exception, match="source_changed"):

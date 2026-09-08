@@ -27,6 +27,7 @@ from backend.persistence.engine import DatabaseError
 from backend.persistence.resources import DatabaseResources
 from backend.persistence.storage import StorageCoordinator
 from backend.persistence.models import utcnow
+from backend.image_naming import content_addressed_key, normalize_extension, saved_filename
 from backend.metadata import (
     CONTEXT_STATUSES,
     MAX_SEMANTIC_DOCUMENT_LENGTH,
@@ -183,60 +184,126 @@ class PostgresMetadataService:
             return record.id
 
     def image_for_meme(self, meme_id: UUID | str) -> tuple[Meme, Path]:
-        """按当前 scope meme_id 返回数据库记录及经过 BlobStore 校验的图片路径。"""
+        """按当前 scope meme_id 返回经过完整身份校验的图片路径。
+
+        输入是稳定 Meme 标识；输出只在数据库 SHA/大小、扩展名、内容寻址 key
+        和实际文件路径全部一致时返回。缺失或身份不一致直接抛出 MetadataError，
+        不把异常记录改写成 repair_required。
+        """
         with self.resources.environment(self.scope.scope_id) as environment:
             record = environment.memes.get(meme_id)
             if record is None:
                 raise MetadataError("metadata_missing")
+            if (
+                not isinstance(record.sha256, str)
+                or len(record.sha256) != 64
+                or any(character not in "0123456789abcdefABCDEF" for character in record.sha256)
+                or record.sha256 != record.sha256.lower()
+                or not isinstance(record.extension, str)
+            ):
+                raise MetadataError("metadata_invalid")
+            try:
+                extension = normalize_extension(record.extension)
+                expected_key = content_addressed_key(record.sha256, extension)
+            except (TypeError, ValueError) as exc:
+                raise MetadataError("metadata_invalid") from exc
+            if record.extension != extension or record.storage_key != expected_key:
+                raise MetadataError("metadata_image_mismatch")
             try:
                 image = self.blob_store.resolve(record.storage_key)
             except DatabaseError as exc:
                 raise MetadataError(exc.code) from exc
+            if image.name != expected_key or image.suffix != extension:
+                raise MetadataError("metadata_image_mismatch")
             identity = self._identity(image)
-            if record.sha256 != identity["sha256"] or record.size_bytes != identity["size_bytes"]:
+            if (
+                identity["extension"] != extension
+                or record.sha256 != identity["sha256"]
+                or record.size_bytes != identity["size_bytes"]
+            ):
                 raise MetadataError("metadata_image_mismatch")
             return record, image
 
-    def find_existing_upload(self, target_key: str, *, sha256: str, size_bytes: int) -> tuple[Meme, Path] | None:
-        """按当前 scope 验证可幂等认领的 durable 上传事实。
+    def find_existing_upload(
+        self,
+        target_key: str | None = None,
+        *,
+        sha256: str,
+        size_bytes: int,
+        extension: str | None = None,
+    ) -> tuple[Meme, Path] | None:
+        """按当前 scope 的内容身份查找可幂等复用的 durable 上传事实。
 
-        返回值为数据库 Meme 与受控图片路径；目标不存在时返回 ``None``。只要目标
-        文件或数据库记录存在但任一指纹不一致，就返回 reconciliation 错误，避免
-        把孤立文件或损坏记录误认成上传成功。
+        ``target_key`` 仅为旧调用方保留，用于在未显式传入扩展名时提取扩展名；查询
+        和文件解析始终使用 ``sha256 + extension`` 内容寻址 key。返回值是数据库 Meme
+        与供内部处理使用的物理路径；同一内容使用新的展示名上传时仍复用原 Meme。
         """
-        with self.resources.environment(self.scope.scope_id) as environment:
-            record = environment.memes.by_storage_key(target_key)
+        if not isinstance(sha256, str) or re.fullmatch(r"[0-9a-fA-F]{64}", sha256) is None:
+            raise MetadataError("sha256_invalid")
+        if type(size_bytes) is not int or size_bytes < 0:
+            raise MetadataError("size_bytes_invalid")
         try:
-            image = self.blob_store.resolve(target_key, must_exist=True)
+            normalized_extension = normalize_extension(extension or (Path(target_key).suffix if target_key else None))
+            physical_key = content_addressed_key(sha256, normalized_extension)
+        except (TypeError, ValueError) as exc:
+            raise MetadataError(str(exc)) from exc
+        with self.resources.environment(self.scope.scope_id) as environment:
+            record = environment.memes.by_content(sha256, normalized_extension)
+        try:
+            image = self.blob_store.resolve(physical_key, must_exist=True)
         except DatabaseError as exc:
             if record is None and exc.code == "file_not_found":
                 return None
             raise MetadataError("upload_reconciliation_required") from exc
         if record is None:
+            # 物理对象存在但没有对应 Meme，不能被当作幂等成功或覆盖目标。
+            raise MetadataError("upload_reconciliation_required")
+        if record.storage_key != physical_key or record.extension != normalized_extension:
             raise MetadataError("upload_reconciliation_required")
         try:
             identity = self._identity(image)
         except MetadataError as exc:
             raise MetadataError("upload_reconciliation_required") from exc
-        # 先验证数据库与存储彼此一致；两者一致但与本次上传不同只是正常同名冲突，
-        # 不应被误报为 reconciliation。只有 durable 事实自身不一致才进入修复路径。
-        if record.size_bytes != identity["size_bytes"] or record.sha256.lower() != str(identity["sha256"]).lower():
+        if (
+            record.size_bytes != identity["size_bytes"]
+            or record.sha256.lower() != str(identity["sha256"]).lower()
+            or record.size_bytes != size_bytes
+            or record.sha256.lower() != sha256.lower()
+        ):
             raise MetadataError("upload_reconciliation_required")
-        if record.size_bytes != size_bytes or record.sha256.lower() != sha256.lower():
-            raise MetadataError("file_exists")
         return record, image
 
     def create_pending(self, image: Path, *, status: str = "pending", meme_id: UUID | None = None) -> SidecarMetadata:
-        """为合法图片幂等创建数据库 Meme 和 pending 语境。"""
+        """为内容寻址图片幂等创建数据库 Meme 和 pending 语境。
+
+        该入口用于已有物理图片首次登记；历史人类文件名不在请求内自动迁移，交由
+        scope 预检报告，避免把列表或语境写入隐式变成物理文件修复。
+        """
         if status not in CONTEXT_STATUSES:
             raise MetadataError("invalid_context_status")
         identity = self._identity(image)
+        try:
+            extension = normalize_extension(str(identity["extension"]))
+            expected_key = content_addressed_key(str(identity["sha256"]), extension)
+        except (TypeError, ValueError) as exc:
+            raise MetadataError(str(exc)) from exc
         key = str(identity["relative_path"])
+        if key != expected_key:
+            raise MetadataError("content_addressed_key_required")
         with self.resources.environment(self.scope.scope_id) as environment:
-            existing = environment.memes.by_storage_key(key)
+            existing = environment.memes.by_content(str(identity["sha256"]), extension)
             if existing:
                 return self._to_sidecar(existing)
-            record = environment.memes.create(storage_key=key, extension=str(identity["extension"]), size_bytes=int(identity["size_bytes"]), sha256=str(identity["sha256"]), context=self._base_context(), provenance={"producer": "system", "model": None, "updated_at": datetime.now(timezone.utc).isoformat(), "field_sources": {}, "last_error": None}, status=status, meme_id=meme_id)
+            record = environment.memes.create(
+                storage_key=expected_key,
+                extension=extension,
+                size_bytes=int(identity["size_bytes"]),
+                sha256=str(identity["sha256"]),
+                context=self._base_context(),
+                provenance={"producer": "system", "model": None, "updated_at": datetime.now(timezone.utc).isoformat(), "field_sources": {}, "last_error": None},
+                status=status,
+                meme_id=meme_id,
+            )
             return self._to_sidecar(record)
 
     def upload_bytes(self, content: bytes, *, target_key: str) -> tuple[UUID, Path]:
@@ -247,6 +314,20 @@ class PostgresMetadataService:
         except DatabaseError as exc:
             raise MetadataError(exc.code) from exc
         return record.id, self.blob_store.resolve(record.storage_key)
+
+    def saved_filename(self, meme: Meme | UUID | str) -> str:
+        """返回 Meme 的公开保存文件名，不暴露内容寻址物理 key。
+
+        输入可以是已加载 Meme 或当前 scope 的稳定 ID；调用场景是上传、合集导入和
+        任务结果投影。数据库读取失败时直接抛出 MetadataError，避免返回不可信名称。
+        """
+        if isinstance(meme, Meme):
+            return saved_filename(meme.display_name, meme.extension)
+        with self.resources.environment(self.scope.scope_id) as environment:
+            record = environment.memes.get(meme)
+            if record is None:
+                raise MetadataError("metadata_missing")
+            return saved_filename(record.display_name, record.extension)
 
     def _merge_payload(self, current: SidecarMetadata, context_updates: dict[str, object], *, producer: str, model: str | None, status: str, error: str | None, agent_context: dict[str, object] | None = None) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         """合并语境并应用人工字段保护，同时保留未知扩展字段。"""
@@ -324,7 +405,7 @@ class PostgresMetadataService:
             environment.uow.session.flush()
 
     def rename(self, source: Path, target: Path) -> SidecarMetadata:
-        """按稳定 Meme 身份更新数据库路径；文件移动由 API 的操作协调器负责。"""
+        """按稳定 Meme 身份更新展示名称，不改变内容寻址物理 key。"""
         source_key = self._relative(source)
         target_key = self._relative(target)
         with self.resources.environment(self.scope.scope_id) as environment:
@@ -332,7 +413,7 @@ class PostgresMetadataService:
             if record is None:
                 raise MetadataError("metadata_missing")
             try:
-                record = environment.memes.rename(record.id, target_key)
+                record = environment.memes.update_display_name(record.id, Path(target_key).stem)
             except DatabaseError as exc:
                 raise MetadataError(exc.code) from exc
             return self._to_sidecar(record)

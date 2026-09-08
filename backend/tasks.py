@@ -196,6 +196,8 @@ class TaskRecord:
     submission_mode: str | None = None
     image_stage: str | None = None
     processing_job_id: str | None = None
+    target_meme_id: str | None = None
+    target_image_sha256: str | None = None
     # 数据库任务的资源归属事实；公开 DTO 不暴露调度内部 key。
     lane_resource_key: str = GLOBAL_LANE_RESOURCE_KEY
     payload: dict[str, Any] = field(default_factory=dict)

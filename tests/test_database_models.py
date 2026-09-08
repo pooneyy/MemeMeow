@@ -13,14 +13,42 @@ from sqlalchemy.orm import Session
 
 from backend.database import AgentCallbackRequest, AgentCallbackRequestRepository, DatabaseError, GLOBAL_LANE_RESOURCE_KEY, ScopeContext, TaskLaneFairness, TaskLaneResourceSlot
 from backend import database
+from backend import metadata
 from backend.persistence import models
 
 
 def test_single_forward_migration_head():
     """仓库只暴露一个前向 revision head，回滚由 migration 明确拒绝。"""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["0021_search_metadata_hash"]
+    assert script.get_heads() == ["0023_image_processing_fixed_plans"]
     assert (Path("alembic/versions/0001_postgres_scoped.py")).is_file()
+
+
+def test_content_identity_migration_preflights_history_and_installs_strict_unique_constraint():
+    """内容身份迁移必须拒绝历史脏记录并安装 scope 内唯一约束。"""
+    migration = Path("alembic/versions/0022_separate_image_display_names_and_content_identity.py").read_text(encoding="utf-8")
+    assert "image_identity_preflight_failed" in migration
+    assert "GROUP BY scope_id, sha256, extension" in migration
+    assert "uq_memes_scope_content" in migration
+    assert "NOT VALID" not in migration
+    assert "ALTER COLUMN display_name SET NOT NULL" in migration
+    assert "ALTER COLUMN metadata_schema_version SET DEFAULT 2" not in migration
+    assert "ALTER COLUMN metadata_schema_version SET DEFAULT 1" in migration
+    assert metadata.SCHEMA_VERSION == 1
+    assert models.Meme.metadata_schema_version.default.arg == 1
+    assert models.Meme.metadata_schema_version.server_default.arg.text == "1"
+    assert "regexp_replace(storage_key" not in migration
+
+
+def test_image_processing_fixed_plan_migration_is_forward_only_and_fail_closed_on_active_history():
+    """图片处理计划迁移必须回填历史、建立目标索引并阻止未归类活动任务。"""
+    migration = Path("alembic/versions/0023_image_processing_fixed_plans.py").read_text(encoding="utf-8")
+    assert 'down_revision = "0022_separate_image_display_names_and_content_identity"' in migration
+    assert "processing_mode" in migration
+    assert "target_meme_id" in migration and "target_image_sha256" in migration
+    assert "image_processing_history_unresolved" in migration
+    assert "ix_tasks_image_target_active" in migration
+    assert "raise RuntimeError" in migration
 
 
 def test_image_processing_migration_is_chained_and_rebuilds_legacy_checks():

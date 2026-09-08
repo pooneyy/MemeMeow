@@ -28,7 +28,7 @@ const image = {
 }
 
 function fullRetryButton(wrapper) {
-  return wrapper.findAll('button').find((button) => button.text().includes('完整重试所有未就绪'))
+  return wrapper.findAll('button').find((button) => button.text().includes('修复所有未就绪'))
 }
 
 describe('LibraryWorkspace', () => {
@@ -42,6 +42,7 @@ describe('LibraryWorkspace', () => {
       submitted_count: 0,
       reused_count: 0,
       conflict_count: 0,
+      not_needed_count: 0,
       failed_count: 0,
       results: [],
     })
@@ -166,6 +167,30 @@ describe('LibraryWorkspace', () => {
     expect(unreadyProcessing.mock.calls[0][0]).not.toHaveProperty('cursor')
   })
 
+  it('完整重试按逐图分类展示提交、冲突和失败', async () => {
+    contextBatch.mockResolvedValue({
+      results: [
+        { meme_id: 'meme-1', category: 'submitted', processing_job_id: 'job-1' },
+        { meme_id: 'meme-2', category: 'processing_active', reason: 'image_processing_active' },
+        { meme_id: 'meme-3', category: 'failed', reason: 'target_changed' },
+      ],
+    })
+    const wrapper = mount(LibraryWorkspace, {
+      props: { config: { reverse_image_available: true }, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+    })
+    await flushPromises()
+
+    await wrapper.get('.image-check input').setValue(true)
+    await wrapper.findAll('button').find((button) => button.text().includes('重试选中')).trigger('click')
+    await wrapper.get('.retry-selected-dialog form').trigger('submit')
+    await wrapper.get('.processing-options-dialog form').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('提交 1 个完整任务，处理中 1，无需修复 0，失败 1')
+    expect(wrapper.get('.processing-result-details').text()).toContain('正在处理：image_processing_active')
+    expect(wrapper.get('.processing-result-details').text()).toContain('提交失败：target_changed')
+  })
+
   it('即使完整重试能力尚未注入，点击主按钮也先显示图片处理选项且不请求', async () => {
     const submitUnreadyProcessing = api.unreadyProcessing
     delete api.unreadyProcessing
@@ -236,17 +261,18 @@ describe('LibraryWorkspace', () => {
     wrapper.unmount()
   })
 
-  it('按提交、复用、冲突和失败分类展示 scope 级摘要及逐图结果', async () => {
+  it('按提交、处理中、无需修复和失败分类展示 scope 级摘要及逐图结果', async () => {
     unreadyProcessing.mockResolvedValue({
       target_count: 4,
       submitted_count: 1,
-      reused_count: 1,
+      reused_count: 0,
       conflict_count: 1,
+      not_needed_count: 1,
       failed_count: 1,
       results: [
-        { meme_id: 'submitted', status: 'submitted', processing_job_id: 'job-1' },
-        { meme_id: 'reused', status: 'reused' },
-        { meme_id: 'conflict', category: 'conflict', error: 'processing_options_conflict' },
+        { meme_id: 'submitted', category: 'submitted', processing_job_id: 'job-1' },
+        { meme_id: 'not-needed', category: 'not_needed', reason: 'already_ready' },
+        { meme_id: 'conflict', category: 'processing_active', reason: 'image_processing_active' },
         { meme_id: 'failed', category: 'failed', error: 'submit_failed' },
       ],
     })
@@ -258,16 +284,16 @@ describe('LibraryWorkspace', () => {
     await wrapper.get('.processing-options-dialog form').trigger('submit')
     await flushPromises()
 
-    expect(wrapper.get('.inline-notice').text()).toContain('目标 4，提交 1，复用 1，冲突 1，失败 1')
+    expect(wrapper.get('.inline-notice').text()).toContain('目标 4，提交 1，处理中 1，无需修复 1，失败 1')
     const details = wrapper.get('.processing-result-details')
     expect(details.text()).toContain('已提交处理任务')
-    expect(details.text()).toContain('已复用处理任务')
-    expect(details.text()).toContain('选项冲突：processing_options_conflict')
+    expect(details.text()).toContain('无需修复：already_ready')
+    expect(details.text()).toContain('正在处理：image_processing_active')
     expect(details.text()).toContain('提交失败：submit_failed')
     expect(details.text()).not.toContain('submitted')
     expect(details.text()).not.toContain('job-1')
     expect(details.text()).not.toContain('reused')
-    expect(details.find('li.conflict').exists()).toBe(true)
+    expect(details.find('li.processing_active').exists()).toBe(true)
     expect(details.find('li.failed').exists()).toBe(true)
   })
 
@@ -287,7 +313,7 @@ describe('LibraryWorkspace', () => {
     expect(unreadyProcessing).toHaveBeenCalledTimes(1)
     expect(wrapper.get('.processing-options-dialog').text()).toContain('提交中...')
 
-    resolveRetry({ target_count: 0, submitted_count: 0, reused_count: 0, conflict_count: 0, failed_count: 0, results: [] })
+    resolveRetry({ target_count: 0, submitted_count: 0, reused_count: 0, conflict_count: 0, not_needed_count: 0, failed_count: 0, results: [] })
     await flushPromises()
     expect(wrapper.find('.processing-options-dialog').exists()).toBe(false)
 
@@ -338,7 +364,7 @@ describe('LibraryWorkspace', () => {
     expect(details.text()).toContain('恢复自动命名')
     expect(details.findAll('.image-processing-stage-retry')).toHaveLength(4)
 
-    for (const label of ['仅视觉', '仅 Agent', '仅文本']) {
+    for (const label of ['仅生成视觉向量', '仅 Agent', '仅文本']) {
       const button = details.findAll('.image-processing-stage-retry').find((candidate) => candidate.text().includes(label))
       expect(button).toBeDefined()
       await button.trigger('click')
@@ -349,7 +375,7 @@ describe('LibraryWorkspace', () => {
     await retry.trigger('click')
     await flushPromises()
 
-    expect(submitImageStage).toHaveBeenNthCalledWith(1, { meme_id: 'meme-1', stage: 'visual', reverse_image_policy: 'forbid' })
+    expect(submitImageStage).toHaveBeenNthCalledWith(1, { meme_id: 'meme-1', stage: 'visual' })
     expect(submitImageStage).toHaveBeenNthCalledWith(2, { meme_id: 'meme-1', stage: 'agent', reverse_image_policy: 'forbid' })
     expect(submitImageStage).toHaveBeenNthCalledWith(3, { meme_id: 'meme-1', stage: 'text_embedding', reverse_image_policy: 'forbid' })
     expect(submitImageStage).toHaveBeenCalledWith({ meme_id: 'meme-1', stage: 'auto_rename', reverse_image_policy: 'forbid' })
@@ -410,6 +436,33 @@ describe('LibraryWorkspace', () => {
       props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
     })
     await flushPromises()
+    expect(wrapper.get('.library-preview-trigger img').attributes('src')).toBe('/media/meme-1')
+    wrapper.unmount()
+  })
+
+  it('总数收缩导致当前页失效时自动回到合法末页并重新读取', async () => {
+    const pageOneImage = { ...image, meme_id: 'meme-1' }
+    const pageTwoImage = { ...image, meme_id: 'meme-51', filename: 'page-51.png', media_url: '/media/meme-51' }
+    images
+      .mockResolvedValueOnce({ items: [pageOneImage], total: 51, page: 1, page_size: 50 })
+      .mockResolvedValueOnce({ items: [pageTwoImage], total: 51, page: 2, page_size: 50 })
+      .mockResolvedValueOnce({ items: [], total: 1, page: 2, page_size: 50 })
+      .mockResolvedValueOnce({ items: [pageOneImage], total: 1, page: 1, page_size: 50 })
+    const wrapper = mount(LibraryWorkspace, {
+      props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
+    })
+    await flushPromises()
+
+    await wrapper.get('.library-pagination button:last-child').trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('第 2 / 2 页，共 51 张')
+
+    await wrapper.get('.toolbar button').trigger('click')
+    await flushPromises()
+
+    expect(images).toHaveBeenNthCalledWith(3, { search: '', page: 2, page_size: 50 })
+    expect(images).toHaveBeenNthCalledWith(4, { search: '', page: 1, page_size: 50 })
+    expect(wrapper.text()).toContain('第 1 / 1 页，共 1 张')
     expect(wrapper.get('.library-preview-trigger img').attributes('src')).toBe('/media/meme-1')
     wrapper.unmount()
   })

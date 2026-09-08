@@ -113,7 +113,7 @@ describe('任务诊断模式', () => {
       props: { config: null, cacheTask: null, cacheBusy: false, refreshToken: 0 },
     })
     await flushPromises()
-    await libraryWrapper.findAll('button').find((button) => button.text().includes('完整重试所有未就绪')).trigger('click')
+    await libraryWrapper.findAll('button').find((button) => button.text().includes('修复所有未就绪')).trigger('click')
     await libraryWrapper.get('.processing-options-dialog form').trigger('submit')
     await flushPromises()
     expect(libraryWrapper.get('.processing-result-details').text()).toContain('meme-debug')

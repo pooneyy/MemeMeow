@@ -6,6 +6,7 @@ engine、Repository、文件存储及资源装配；模型模块不反向依赖�
 
 from __future__ import annotations
 
+import re
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -30,7 +31,9 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
+
+from backend.image_naming import normalize_display_name, normalize_extension
 
 
 EMBEDDING_DIMENSIONS = 1024
@@ -91,16 +94,22 @@ class InstallationState(Base):
 
 
 class Meme(Base):
-    """稳定 UUID Meme 身份及版本化结构化语境。"""
+    """稳定 UUID Meme 身份及版本化结构化语境。
+
+    `storage_key`、扩展名和 SHA 是不可变的图片物理身份；`display_name` 是当前
+    scope 内可重复修改的用户可见名称。Repository 和 HTTP 层都应按稳定 `id`
+    定位记录，不能把展示名称当作文件路径或去重键。
+    """
 
     __tablename__ = "memes"
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     scope_id: Mapped[str] = mapped_column(String(128), ForeignKey("scopes.id", ondelete="CASCADE"), nullable=False)
     storage_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False, default="image", server_default=text("'image'"))
     extension: Mapped[str] = mapped_column(String(16), nullable=False)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    metadata_schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    metadata_schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
     context_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     search_metadata_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     meme_context: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
@@ -113,11 +122,46 @@ class Meme(Base):
     __table_args__ = (
         UniqueConstraint("scope_id", "id", name="uq_memes_scope_id"),
         UniqueConstraint("scope_id", "storage_key", name="uq_memes_scope_storage"),
+        UniqueConstraint("scope_id", "sha256", "extension", name="uq_memes_scope_content"),
+        Index("ix_memes_scope_display_name", "scope_id", "display_name", "id"),
         CheckConstraint("size_bytes >= 0", name="ck_memes_size_nonnegative"),
         CheckConstraint("context_status IN ('pending','partial','ready','repair_required')", name="ck_memes_context_status"),
         CheckConstraint("search_metadata_hash IS NULL OR length(search_metadata_hash) = 64", name="ck_memes_search_metadata_hash"),
+        CheckConstraint("extension = lower(extension) AND extension IN ('.png','.jpg','.jpeg','.gif')", name="ck_memes_extension_normalized"),
+        CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="ck_memes_sha256_hex"),
+        CheckConstraint("storage_key = sha256 || extension", name="ck_memes_storage_key_content_addressed"),
+        CheckConstraint(
+            "display_name IS NOT NULL AND display_name <> '' AND char_length(display_name) <= 255 "
+            "AND display_name = btrim(display_name, ' .') "
+            "AND position('/' in display_name) = 0 "
+            "AND position(chr(92) in display_name) = 0 "
+            "AND display_name !~ '[[:cntrl:]]' "
+            "AND display_name NOT IN ('.', '..', '.staging', '.quarantine') "
+            "AND lower(display_name) NOT LIKE '%.png' "
+            "AND lower(display_name) NOT LIKE '%.jpg' "
+            "AND lower(display_name) NOT LIKE '%.jpeg' "
+            "AND lower(display_name) NOT LIKE '%.gif'",
+            name="ck_memes_display_name_safe",
+        ),
         CheckConstraint("storage_key <> '' AND storage_key NOT IN ('.', '..', '.staging', '.quarantine') AND position('/' in storage_key) = 0 AND position(chr(92) in storage_key) = 0 AND storage_key !~ '[[:cntrl:]]'", name="ck_memes_storage_key_flat"),
     )
+
+    @validates("display_name")
+    def _validate_display_name(self, _key: str, value: object) -> str:
+        """在 ORM 赋值边界规范化展示名称，供创建和人工更新共同使用。"""
+        return normalize_display_name(value)
+
+    @validates("extension")
+    def _validate_extension(self, _key: str, value: object) -> str:
+        """在 ORM 赋值边界统一图片扩展名，避免唯一键出现大小写分叉。"""
+        return normalize_extension(value)
+
+    @validates("sha256")
+    def _validate_sha256(self, _key: str, value: object) -> str:
+        """在 ORM 赋值边界校验并统一图片内容 SHA-256 的小写表示。"""
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+            raise ValueError("sha256_invalid")
+        return value.lower()
 
 
 class DerivedImageThumbnail(Base):
@@ -338,6 +382,10 @@ class Task(Base):
     submission_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
     image_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
     processing_job_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    # 新图片阶段任务把目标图片作为结构化事实保存，供跨模式活动门禁直接查询；
+    # 迁移前无法可靠归类的历史任务保留为空并只读兼容。
+    target_meme_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    target_image_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lane: Mapped[str] = mapped_column(String(64), nullable=False, default="default")
     lane_resource_key: Mapped[str] = mapped_column(String(128), nullable=False, default=GLOBAL_LANE_RESOURCE_KEY, server_default=text("'__global__'"))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
@@ -378,10 +426,12 @@ class Task(Base):
     __table_args__ = (
         ForeignKeyConstraint(["scope_id"], ["scopes.id"], ondelete="CASCADE"),
         ForeignKeyConstraint(["scope_id", "processing_job_id"], ["image_processing_jobs.scope_id", "image_processing_jobs.id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(["scope_id", "target_meme_id"], ["memes.scope_id", "memes.id"], ondelete="CASCADE"),
         CheckConstraint("status IN ('queued','running','succeeded','failed')", name="ck_task_status"),
         CheckConstraint("attempt_count >= 0 AND max_attempts > 0", name="ck_task_attempts"),
         CheckConstraint("submission_mode IS NULL OR submission_mode IN ('pipeline','standalone')", name="ck_task_submission_mode"),
         CheckConstraint("image_stage IS NULL OR image_stage IN ('visual','agent','auto_rename','text_embedding')", name="ck_task_image_stage"),
+        CheckConstraint("target_image_sha256 IS NULL OR length(target_image_sha256) = 64", name="ck_task_target_image_sha256"),
         CheckConstraint("submission_mode IS NULL OR (submission_mode = 'standalone' AND processing_job_id IS NULL) OR (submission_mode = 'pipeline' AND processing_job_id IS NOT NULL)", name="ck_task_submission_job_exclusivity"),
         CheckConstraint("task_type NOT IN ('visual_embedding_generation','meme_context_generation','image_auto_rename','text_embedding_generation') OR (submission_mode IS NULL OR (image_stage IS NOT NULL AND ((task_type = 'visual_embedding_generation' AND image_stage = 'visual') OR (task_type = 'meme_context_generation' AND image_stage = 'agent') OR (task_type = 'image_auto_rename' AND image_stage = 'auto_rename') OR (task_type = 'text_embedding_generation' AND image_stage = 'text_embedding'))))", name="ck_task_image_stage_type"),
         CheckConstraint("length(lane_resource_key) > 0", name="ck_task_lane_resource_key"),
@@ -390,6 +440,7 @@ class Task(Base):
         CheckConstraint("visual_snapshot_candidate_count IS NULL OR visual_snapshot_candidate_count >= 0", name="ck_task_visual_snapshot_candidate_count"),
         UniqueConstraint("scope_id", "id", name="uq_task_scope_id"),
         Index("ix_tasks_image_submission", "scope_id", "submission_mode", "image_stage", "processing_job_id", "created_at"),
+        Index("ix_tasks_image_target_active", "scope_id", "target_meme_id", "target_image_sha256", "status", "created_at"),
     )
 
 
@@ -534,6 +585,7 @@ class ImageProcessingJob(Base):
     processing_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     reverse_image_policy: Mapped[str] = mapped_column(String(16), nullable=False, default="forbid")
     auto_name: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    processing_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="normal", server_default=text("'normal'"))
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     current_stage: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
@@ -551,6 +603,7 @@ class ImageProcessingJob(Base):
         UniqueConstraint("scope_id", "id", name="uq_image_processing_jobs_scope_id"),
         UniqueConstraint("scope_id", "meme_id", "image_sha256", "revision", name="uq_image_processing_jobs_revision"),
         CheckConstraint("reverse_image_policy IN ('forbid','auto')", name="ck_image_processing_policy"),
+        CheckConstraint("processing_mode IN ('normal','full_retry','repair')", name="ck_image_processing_mode"),
         CheckConstraint("status IN ('queued','running','succeeded','failed','blocked','unknown_execution')", name="ck_image_processing_status"),
         CheckConstraint("claim_generation >= 0", name="ck_image_processing_generation"),
         Index("ix_image_processing_jobs_active", "scope_id", "meme_id", "image_sha256", "status"),
@@ -566,6 +619,8 @@ class ImageProcessingStage(Base):
     job_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     stage: Mapped[str] = mapped_column(String(64), primary_key=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    planned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
+    skip_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     task_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
@@ -579,6 +634,8 @@ class ImageProcessingStage(Base):
         ForeignKeyConstraint(["scope_id", "task_id"], ["tasks.scope_id", "tasks.id"], ondelete="CASCADE"),
         CheckConstraint("stage IN ('visual','agent','auto_rename','text_embedding')", name="ck_image_processing_stage_name"),
         CheckConstraint("status IN ('queued','running','succeeded','failed','blocked','unknown_execution','skipped','warning')", name="ck_image_processing_stage_status"),
+        CheckConstraint("(planned AND skip_reason IS NULL) OR (NOT planned AND skip_reason IN ('already_ready','disabled'))", name="ck_image_processing_stage_plan"),
+        CheckConstraint("(planned AND status <> 'skipped') OR (NOT planned AND status = 'skipped')", name="ck_image_processing_stage_plan_status"),
         Index("ix_image_processing_stages_task", "scope_id", "task_id"),
     )
 

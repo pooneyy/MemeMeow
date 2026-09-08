@@ -150,6 +150,8 @@ export interface TaskItem {
 export interface ImageProcessingStage {
   stage: 'visual' | 'agent' | 'auto_rename' | 'text_embedding'
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'blocked' | 'unknown_execution' | 'skipped' | 'warning'
+  planned?: boolean
+  skip_reason?: 'already_ready' | 'disabled' | null
   task_id?: string | null
   attempt?: number
   error?: { error?: string; message?: string } | null
@@ -171,6 +173,7 @@ export interface ImageProcessingJob {
   image_sha256: string
   reverse_image_policy: string
   auto_name?: boolean
+  processing_mode?: 'normal' | 'full_retry' | 'repair'
   status: string
   has_warnings?: boolean
   warnings?: Array<{ stage?: string; error?: string; message?: string; recoverable?: boolean }>
@@ -213,8 +216,9 @@ export interface UnreadyProcessingResponse {
   submitted_count: number
   reused_count: number
   conflict_count: number
+  not_needed_count: number
   failed_count: number
-  results: Array<{ meme_id: string; processing_job_id?: string; status?: string; reused?: boolean; error?: string; category?: 'submitted' | 'reused' | 'conflict' | 'failed' }>
+  results: Array<{ meme_id: string; processing_job_id?: string; status?: string; reused?: boolean; error?: string; reason?: string; category?: 'submitted' | 'processing_active' | 'not_needed' | 'reused' | 'conflict' | 'failed' }>
 }
 
 /** 图片库按阶段批量提交响应的最小稳定形状。 */

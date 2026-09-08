@@ -152,6 +152,13 @@ function processingPipelineLabel(job: ImageProcessingJob): string {
   return hasAutoRenameStage ? '四阶段流水线' : '三阶段流水线'
 }
 
+/** 将固定计划中的未执行原因翻译成用户能直接理解的短句。 */
+function stagePlanLabel(stage: ImageProcessingJob['stages'][number]): string {
+  if (stage.skip_reason === 'disabled') return '本次未启用'
+  if (stage.skip_reason === 'already_ready') return '已有结果，无需执行'
+  return '未启用'
+}
+
 /** 加载完整图片处理 Job；旧测试夹具没有该 API 时保持任务列表兼容。 */
 async function loadProcessingJobs(): Promise<void> {
   if (typeof api.processingJobs !== 'function') return
@@ -319,8 +326,8 @@ onBeforeUnmount(() => {
             <button v-for="stage in entry.job.stages" :key="`${entry.job.job_id}:${stage.stage}`" class="task-stage-row" type="button" :disabled="!stage.task_id" @click="stage.task_id && openTask(stage.task_id, $event)">
               <span><i :class="`status-dot ${stage.status}`" aria-hidden="true"></i>{{ imageStageLabel(stage.stage) }}</span>
               <span>{{ imageStageStatusLabel(stage.status) }}</span>
-              <span v-if="showTaskDiagnostics">{{ stage.task_id || (stage.status === 'skipped' ? '未启用' : '等待创建叶子任务') }}</span>
-              <span v-else>{{ stage.attempt != null ? `第 ${stage.attempt} 次尝试` : stage.status === 'skipped' ? '未启用' : '—' }}</span>
+              <span v-if="showTaskDiagnostics">{{ stage.task_id || (stage.status === 'skipped' ? stagePlanLabel(stage) : '等待创建叶子任务') }}</span>
+              <span v-else>{{ stage.attempt != null ? `第 ${stage.attempt} 次尝试` : stage.status === 'skipped' ? stagePlanLabel(stage) : '—' }}</span>
               <span v-if="stage.error" class="task-error">{{ stage.error.error || '阶段失败' }}</span>
               <span v-if="stage.status === 'warning'" class="task-error warning">处理完成，自动重命名未完成</span>
             </button>

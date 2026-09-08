@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import HTTPException, Request
 
 from backend.database import DatabaseError
+from backend.image_naming import saved_filename
 
 
 EnvironmentProvider = Callable[[Request], Any]
@@ -138,11 +139,21 @@ async def get_collection(
             for _item, meme in database_environment.collections.members(row.id, page=page, page_size=page_size):
                 scoped_metadata = metadata_service(request)
                 metadata_status = scoped_metadata.status(scoped_metadata.blob_store.resolve(meme.storage_key))
+                display_name = getattr(meme, "display_name", None)
+                extension = getattr(meme, "extension", None)
+                try:
+                    public_filename = saved_filename(display_name, extension)
+                except ValueError as exc:
+                    # 数据库约束应阻止此分支；若历史脏记录漏过约束，不能把物理 key
+                    # 作为用户文件名泄露，直接交给统一业务错误边界处理。
+                    raise DatabaseError("invalid_display_name") from exc
                 members.append(
                     {
                         "meme_id": str(meme.id),
-                        "filename": meme.storage_key,
-                        "extension": meme.extension,
+                        "display_name": display_name,
+                        "filename": public_filename,
+                        "saved_filename": public_filename,
+                        "extension": extension,
                         "size": meme.size_bytes,
                         "media_url": f"/media/{meme.id}",
                         "metadata": metadata_status,

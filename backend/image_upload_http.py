@@ -17,6 +17,7 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 
 from backend.collection_packages import sha256_bytes
 from backend.database import DatabaseError
+from backend.image_naming import is_content_addressed_key, public_filename_fields
 from backend.image_processing import ImageProcessingError
 from backend.image_safety import ImagePreflightError, validate_image_content
 from backend.metadata import MetadataError
@@ -54,6 +55,39 @@ ThumbnailEnqueue = Callable[[Request, str], Any]
 EnqueueErrorProjector = Callable[[Exception], str]
 SearchInvalidator = Callable[[Request], None]
 OperationErrorProjector = Callable[[OperationPolicyError], HTTPException]
+
+
+def _is_private_filename(value: object, record: Any) -> bool:
+    """判断文件名是否是内容寻址物理 key，供公开结果 fail-closed 投影。"""
+    if is_content_addressed_key(value, getattr(record, "sha256", None), getattr(record, "extension", None)):
+        return True
+    if not isinstance(value, str):
+        return False
+    candidate = Path(value).name
+    if candidate != value:
+        return False
+    return is_content_addressed_key(candidate, Path(candidate).stem, Path(candidate).suffix)
+
+
+def _public_saved_filename(metadata_service: Any, record: Any, fallback: Path | str) -> str | None:
+    """投影用户可见文件名，优先使用数据库展示名而不是物理 storage key。"""
+    resolver = getattr(metadata_service, "saved_filename", None)
+    if callable(resolver):
+        try:
+            value = resolver(record)
+        except (DatabaseError, MetadataError, TypeError, ValueError):
+            value = None
+        if isinstance(value, str) and value:
+            if _is_private_filename(value, record):
+                return None
+            return value
+    try:
+        return public_filename_fields(record)["filename"]
+    except ValueError:
+        value = Path(fallback).name
+        if _is_private_filename(value, record):
+            return None
+        return value
 
 
 class _BoundedUploadMultipartParser(MultiPartParser):
@@ -144,13 +178,15 @@ def idempotent_upload_result(
         "meme_id": str(record.id),
         "filename": original,
         "ok": True,
-        "saved_filename": Path(record.storage_key).name,
         "media_url": f"/media/{record.id}",
         "metadata_status": metadata_service.status(image)["status"],
         "idempotent": True,
         "auto_name": auto_name,
         "reverse_image_policy": reverse_image_policy,
     }
+    public_filename = _public_saved_filename(metadata_service, record, record.storage_key)
+    if public_filename is not None:
+        result["saved_filename"] = public_filename
     if thumbnail_enqueue is not None:
         try:
             thumbnail_enqueue(request, str(record.id))
@@ -370,10 +406,12 @@ async def upload_images(
             "meme_id": meme_id,
             "filename": original,
             "ok": True,
-            "saved_filename": target.name,
             "media_url": f"/media/{meme_id}",
             "auto_named": False,
         }
+        public_filename = _public_saved_filename(scoped_metadata, meme_id, target)
+        if public_filename is not None:
+            result["saved_filename"] = public_filename
         if thumbnail_enqueue is not None:
             try:
                 thumbnail_enqueue(request, meme_id)
@@ -390,7 +428,6 @@ async def upload_images(
                     request,
                     target,
                     batch_id=upload_batch_id,
-                    reverse_image_policy=reverse_image_policy,
                     schedule=upload_batch_id is None,
                 )
                 result["visual_task_id"] = task.task_id

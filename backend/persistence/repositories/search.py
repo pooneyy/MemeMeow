@@ -1,8 +1,8 @@
 """SearchRepository 的 scope 绑定持久化访问。
 
-该模块位于持久化 Repository 边界，只负责 generation/head、迁移控制面、legacy 与
-incremental 文本 embedding 查询及向量排序；视觉向量、任务、文件存储和资源装配由
-其它模块负责，backend.database 继续提供历史兼容导出。
+该模块位于持久化 Repository 边界，只负责 generation/head、迁移控制面和增量文本
+embedding 查询；视觉向量、任务、文件存储和资源装配由其它模块负责，旧 generation
+仅保留给历史数据管理接口，不作为运行时搜索来源。
 """
 
 from __future__ import annotations
@@ -10,14 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from typing import Any, Sequence
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from backend.paths import validate_business_storage_key
 from backend.persistence.engine import DatabaseError
 from backend.persistence.models import (
     EMBEDDING_DIMENSIONS,
@@ -28,6 +28,7 @@ from backend.persistence.models import (
     SearchGeneration,
     SearchHead,
     SearchMigrationState,
+    StorageOperation,
     Task,
     utcnow,
 )
@@ -73,19 +74,20 @@ class SearchRepository:
         return generation
 
     def migration_state(self, model: str | None = None) -> SearchMigrationState | None:
-        """读取当前 scope 的迁移状态，并避免跨模型复用 epoch。"""
+        """读取当前 scope 的迁移状态；调用方负责精确核对 model。"""
         state = self.session.scalar(select(SearchMigrationState).where(SearchMigrationState.scope_id == self.scope.scope_id))
-        if state is None or model is None or state.model is None or state.model == model:
-            return state
-        return None
+        # 不在这里把错模型折叠成 ``None``，否则 source_mode 无法区分缺失状态和
+        # 错模型状态，容易把未完成迁移误判为可用来源。
+        return state
 
-    def begin_incremental_backfill(self, model: str, *, total_count: int = 0, legacy_generation_id: UUID | str | None = None) -> SearchMigrationState:
+    def begin_incremental_backfill(self, model: str, *, total_count: int = 0, legacy_generation_id: UUID | str | None = None, claim: tuple[str, int, str] | None = None) -> SearchMigrationState:
         """以新 epoch 开始当前 scope 的增量向量回填，并冻结旧 generation 来源。"""
         if not isinstance(model, str) or not model.strip():
             raise DatabaseError("migration_model_invalid")
         model = model.strip()
         if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count < 0:
             raise DatabaseError("migration_count_invalid")
+        self._assert_claim(claim)
         normalized_total = total_count
         state = self.migration_state()
         if state is None:
@@ -112,11 +114,19 @@ class SearchRepository:
             if generation is None:
                 raise DatabaseError("migration_generation_invalid")
             state.legacy_generation_id = identifier
+        # 新 epoch 的 ready 行不能被上一次回填误认为当前结果；查询在 backfill
+        # 期间本来就被门禁，但清理旧行还能让最终覆盖校验保持单一事实。
+        self.session.execute(
+            delete(MemeTextEmbedding).where(
+                MemeTextEmbedding.scope_id == self.scope.scope_id,
+                MemeTextEmbedding.embedding_model_version == model,
+            )
+        )
         state.updated_at = utcnow()
         self.session.flush()
         return state
 
-    def record_incremental_backfill(self, *, epoch: int, completed_count: int, total_count: int | None = None, model: str | None = None) -> bool:
+    def record_incremental_backfill(self, *, epoch: int, completed_count: int, total_count: int | None = None, model: str | None = None, claim: tuple[str, int, str] | None = None) -> bool:
         """仅更新同一迁移 epoch 的回填进度，拒绝旧 Worker 覆盖新 epoch。"""
         if isinstance(epoch, bool) or not isinstance(epoch, int):
             return False
@@ -125,6 +135,7 @@ class SearchRepository:
             return False
         if model is not None and (not isinstance(model, str) or not model.strip()):
             return False
+        self._assert_claim(claim)
         filters = [SearchMigrationState.scope_id == self.scope.scope_id, SearchMigrationState.mode == "backfill", SearchMigrationState.epoch == requested_epoch]
         if model is not None:
             filters.append(SearchMigrationState.model == str(model).strip())
@@ -153,42 +164,43 @@ class SearchRepository:
         self.session.flush()
         return True
 
-    def switch_incremental_only(self, *, epoch: int, model: str | None = None) -> bool:
-        """在同一事务中将完成的回填 epoch 原子切换为增量唯一来源。"""
-        if isinstance(epoch, bool) or not isinstance(epoch, int):
-            return False
-        requested_epoch = epoch
-        if requested_epoch < 1:
-            return False
-        if model is not None and (not isinstance(model, str) or not model.strip()):
-            return False
-        filters = [SearchMigrationState.scope_id == self.scope.scope_id, SearchMigrationState.mode == "backfill", SearchMigrationState.epoch == requested_epoch]
-        if model is not None:
-            filters.append(SearchMigrationState.model == str(model).strip())
-        state = self.session.scalar(select(SearchMigrationState).where(*filters).with_for_update())
-        if state is None or state.completed_count < state.total_count:
-            return False
-        state.mode = "incremental_only"
-        state.updated_at = utcnow()
-        self.session.flush()
-        return True
+    def _incremental_candidate_keys(self, model: str) -> set[tuple[UUID, str, str]]:
+        """读取当前数据库中可解析且有非空语义文档的候选键。"""
+        from backend.metadata import MemeContext, semantic_document
+        from backend.persistence.repositories.memes import _durable_meme_clause
 
-    @staticmethod
-    def _metadata_hash(meme: Meme) -> str | None:
-        """读取 Meme 事务性维护的七字段语义 hash。"""
-        if isinstance(meme.search_metadata_hash, str) and len(meme.search_metadata_hash) == 64:
-            return meme.search_metadata_hash
-        try:
-            from backend.metadata import MemeContext, semantic_document_hash
+        active_operation = select(StorageOperation.id).where(
+            StorageOperation.scope_id == self.scope.scope_id,
+            StorageOperation.meme_id == Meme.id,
+            StorageOperation.status.in_(("prepared", "file_applied")),
+        ).exists()
 
-            return semantic_document_hash(MemeContext.model_validate(meme.meme_context or {}))
-        except (TypeError, ValueError):
-            return None
+        rows = self.session.scalars(
+            select(Meme).where(
+                Meme.scope_id == self.scope.scope_id,
+                Meme.context_status.in_(("partial", "ready")),
+                Meme.search_metadata_hash.is_not(None),
+                ~active_operation,
+                _durable_meme_clause(),
+            )
+        )
+        result: set[tuple[UUID, str, str]] = set()
+        for meme in rows:
+            metadata_hash = self._metadata_hash(meme)
+            if metadata_hash is None:
+                continue
+            try:
+                if not semantic_document(MemeContext.model_validate(meme.meme_context or {})):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            result.add((meme.id, str(meme.sha256).lower(), metadata_hash))
+        return result
 
-    def _incremental_rows(self, model: str) -> list[tuple[MemeTextEmbedding, Meme]]:
-        """读取当前 scope 中通过 SHA、语境和 metadata hash 校验的单图向量。"""
+    def _ready_incremental_keys(self, model: str) -> set[tuple[UUID, str, str]]:
+        """读取与当前 Meme SHA/hash 完全匹配的 ready 向量键。"""
         rows = self.session.execute(
-            select(MemeTextEmbedding, Meme)
+            select(MemeTextEmbedding.meme_id, MemeTextEmbedding.image_sha256, MemeTextEmbedding.metadata_hash)
             .join(Meme, (Meme.scope_id == MemeTextEmbedding.scope_id) & (Meme.id == MemeTextEmbedding.meme_id))
             .where(
                 MemeTextEmbedding.scope_id == self.scope.scope_id,
@@ -200,76 +212,99 @@ class SearchRepository:
                 Meme.sha256 == MemeTextEmbedding.image_sha256,
                 Meme.search_metadata_hash == MemeTextEmbedding.metadata_hash,
             )
-            # 不在去重和 metadata 校验前截断结果；历史 hash 或损坏行可能占据
-            # 前部，固定 limit 会让后面的有效 Meme 永远无法参与查询。
-            .order_by(MemeTextEmbedding.meme_id.asc(), MemeTextEmbedding.updated_at.desc())
-        ).all()
-        valid: list[tuple[MemeTextEmbedding, Meme]] = []
-        seen: set[UUID] = set()
-        for row, meme in rows:
-            if meme.id in seen or self._metadata_hash(meme) != row.metadata_hash:
-                continue
-            try:
-                if len(row.embedding or []) != EMBEDDING_DIMENSIONS:
-                    continue
-            except TypeError:
-                continue
-            seen.add(meme.id)
-            valid.append((row, meme))
-        return valid
+        )
+        return {(meme_id, str(image_sha256).lower(), metadata_hash) for meme_id, image_sha256, metadata_hash in rows}
 
-    def _legacy_rows(self, model: str) -> list[tuple[MemeEmbedding, Meme]]:
-        """逐条校验迁移回退 generation 的 scope、版本、语境和安全 storage key。"""
-        # 迁移状态一旦存在就代表旧 generation 来源已经被控制面冻结；即使
-        # legacy_generation_id 为空，也不能重新读取会随时变化的 SearchHead。
-        state = self.session.scalar(select(SearchMigrationState).where(SearchMigrationState.scope_id == self.scope.scope_id))
-        if state is not None:
-            if state.model is not None and state.model != model:
-                return []
-            generation_id = state.legacy_generation_id
+    def switch_incremental_only(
+        self,
+        *,
+        epoch: int,
+        model: str | None = None,
+        expected_candidates: Sequence[tuple[UUID | str, str, str]] | None = None,
+        claim: tuple[str, int, str] | None = None,
+    ) -> bool:
+        """在 claim fencing 和当前候选覆盖校验后原子切换增量唯一来源。"""
+        if isinstance(epoch, bool) or not isinstance(epoch, int):
+            return False
+        requested_epoch = epoch
+        if requested_epoch < 1:
+            return False
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            return False
+        self._assert_claim(claim)
+        filters = [SearchMigrationState.scope_id == self.scope.scope_id, SearchMigrationState.mode == "backfill", SearchMigrationState.epoch == requested_epoch]
+        if model is not None:
+            filters.append(SearchMigrationState.model == str(model).strip())
+        state = self.session.scalar(select(SearchMigrationState).where(*filters).with_for_update())
+        if state is None or state.completed_count < state.total_count or state.total_count <= 0:
+            return False
+        normalized_model = str(state.model or "").strip()
+        if not normalized_model or (model is not None and normalized_model != str(model).strip()):
+            return False
+        current_candidates = self._incremental_candidate_keys(normalized_model)
+        if expected_candidates is None:
+            expected = current_candidates
         else:
-            head = self.session.scalar(select(SearchHead).where(SearchHead.scope_id == self.scope.scope_id, SearchHead.model == model))
-            generation_id = head.active_generation_id if head is not None else None
-        if generation_id is None:
-            return []
-        generation = self.session.scalar(select(SearchGeneration).where(SearchGeneration.scope_id == self.scope.scope_id, SearchGeneration.id == generation_id, SearchGeneration.model == model, SearchGeneration.status == "active"))
-        if generation is None or generation.dimensions != EMBEDDING_DIMENSIONS:
-            return []
-        rows = self.session.execute(
-            select(MemeEmbedding, Meme)
-            .join(Meme, (Meme.scope_id == MemeEmbedding.scope_id) & (Meme.id == MemeEmbedding.meme_id))
-            .where(
-                MemeEmbedding.scope_id == self.scope.scope_id,
-                MemeEmbedding.generation_id == generation_id,
-                MemeEmbedding.item_status == "ready",
-                MemeEmbedding.meme_revision == Meme.revision,
-                MemeEmbedding.image_sha256 == Meme.sha256,
-                Meme.context_status.in_(("partial", "ready")),
-            )
-            # generation 与 meme_id 是复合主键；不能引用不存在的单列 id。
-            .order_by(MemeEmbedding.meme_id.asc())
-        ).all()
-        valid: list[tuple[MemeEmbedding, Meme]] = []
-        seen: set[UUID] = set()
-        for row, meme in rows:
-            if meme.id in seen or not isinstance(meme.storage_key, str):
-                continue
-            try:
-                validate_business_storage_key(meme.storage_key)
-                if row.dimensions != EMBEDDING_DIMENSIONS or len(row.embedding or []) != EMBEDDING_DIMENSIONS:
-                    continue
-            except (TypeError, ValueError):
-                continue
-            if self._metadata_hash(meme) != row.metadata_hash:
-                continue
-            seen.add(meme.id)
-            valid.append((row, meme))
-        return valid
+            expected: set[tuple[UUID, str, str]] = set()
+            for meme_id, image_sha256, metadata_hash in expected_candidates:
+                try:
+                    identifier = UUID(str(meme_id))
+                except (TypeError, ValueError):
+                    return False
+                if (
+                    not isinstance(image_sha256, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", image_sha256) is None
+                    or not isinstance(metadata_hash, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", metadata_hash) is None
+                ):
+                    return False
+                expected.add((identifier, image_sha256.lower(), metadata_hash))
+            if len(expected) != len(expected_candidates):
+                # expected_candidates 表示扫描时的精确快照；重复项会掩盖扫描
+                # 或并发 bug，不能被 set 去重后误认为覆盖完整。
+                return False
+        if current_candidates != expected or len(expected) != state.total_count:
+            return False
+        if self._ready_incremental_keys(normalized_model) != expected:
+            return False
+        # 在写入 incremental_only 前再次 fencing，避免 claim 在前面的覆盖查询
+        # 期间过期后仍能提交来源切换。
+        self._assert_claim(claim)
+        state.mode = "incremental_only"
+        state.updated_at = utcnow()
+        self.session.flush()
+        return True
+
+    @staticmethod
+    def _metadata_hash(meme: Meme) -> str | None:
+        """验证已存 hash 确实来自七字段语义文本；不信任孤立字符串。"""
+        try:
+            from backend.metadata import MemeContext, semantic_document_hash
+
+            expected = semantic_document_hash(MemeContext.model_validate(meme.meme_context or {}))
+        except (TypeError, ValueError):
+            return None
+        stored = getattr(meme, "search_metadata_hash", None)
+        if expected is None or not isinstance(stored, str) or stored != expected:
+            return None
+        return expected
 
     def source_mode(self, model: str) -> str:
-        """返回当前唯一运行时来源；回填期间不暴露旧 generation。"""
-        state = self.migration_state(model)
-        if state is not None and state.mode != "incremental_only":
+        """返回当前唯一运行时来源；缺失或错模型状态一律不可用。"""
+        if not isinstance(model, str) or not model.strip():
+            return "not_ready"
+        normalized_model = model.strip()
+        if not hasattr(self, "session"):
+            # 生产 repository 必须绑定数据库 Session；没有 Session 的历史内存 facade
+            # 不能读取向量或伪造可用来源。
+            return "not_ready"
+        state = self.migration_state(normalized_model)
+        if state is None or state.mode != "incremental_only":
+            return "not_ready"
+        # ORM 状态始终有 model；缺失属性只为无 Session 的旧测试 facade 保留
+        # 最小兼容，真实数据库不会把未知模型当成当前来源。
+        stored_model = getattr(state, "model", normalized_model)
+        if stored_model != normalized_model:
             return "not_ready"
         return "incremental"
 
@@ -277,6 +312,7 @@ class SearchRepository:
         """判断当前 scope 是否至少有一条可检索的单图向量。"""
         if self.source_mode(model) != "incremental":
             return False
+        model = model.strip()
         statement = (
             select(MemeTextEmbedding.meme_id)
             .join(Meme, (Meme.scope_id == MemeTextEmbedding.scope_id) & (Meme.id == MemeTextEmbedding.meme_id))
@@ -301,24 +337,29 @@ class SearchRepository:
     def valid_text_embedding_ids(self, model: str, memes: Sequence[Meme]) -> set[UUID]:
         """返回给定图片中具有当前有效文本向量的 Meme ID。
 
-        依据当前迁移来源复用逐条校验结果；每个 Meme 都必须同时满足 scope、图片
-        SHA、metadata hash、模型、维度和向量状态约束，不能由 scope 级缓存状态推断。
+        查询只投影 ID；每个 Meme 都必须同时满足 scope、图片 SHA、metadata hash、
+        模型、维度和向量状态约束，不能由 scope 级缓存状态推断。
         """
         if not isinstance(model, str) or not model.strip():
+            return set()
+        model = model.strip()
+        if self.source_mode(model) != "incremental":
             return set()
         meme_ids = {meme.id for meme in memes if isinstance(getattr(meme, "id", None), UUID)}
         if not meme_ids:
             return set()
-
         if not hasattr(self, "session"):
-            return {meme.id for _row, meme in self._incremental_rows(model) if meme.id in meme_ids}
+            # 生产 repository 必须绑定数据库；历史内存 facade 不得重新引入
+            # Python 全量加载向量的隐式回退。
+            return set()
+
         rows = self.session.execute(
             select(MemeTextEmbedding.meme_id)
             .join(Meme, (Meme.scope_id == MemeTextEmbedding.scope_id) & (Meme.id == MemeTextEmbedding.meme_id))
             .where(
                 MemeTextEmbedding.scope_id == self.scope.scope_id,
                 MemeTextEmbedding.meme_id.in_(meme_ids),
-                MemeTextEmbedding.embedding_model_version == model.strip(),
+                MemeTextEmbedding.embedding_model_version == model,
                 MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
                 MemeTextEmbedding.status == "ready",
                 MemeTextEmbedding.embedding.is_not(None),
@@ -483,29 +524,12 @@ class SearchRepository:
         norm = math.sqrt(sum(value * value for value in values))
         if not math.isfinite(norm) or norm <= 0:
             raise DatabaseError("embedding_zero_norm")
-        if self.source_mode(model) != "incremental":
+        normalized_model = model.strip() if isinstance(model, str) else model
+        if self.source_mode(normalized_model) != "incremental":
             raise DatabaseError("cache_not_ready")
-        return self.query_incremental(model, vector, limit)
-
-    def _query_legacy_validated(self, model: str, vector: Sequence[float], limit: int) -> list[tuple[UUID, float]]:
-        """对通过旧 generation 逐条校验的向量执行单一来源排序。"""
-        values = [float(value) for value in vector]
-        norm = math.sqrt(sum(value * value for value in values))
-        if not math.isfinite(norm) or norm <= 0:
-            raise DatabaseError("embedding_zero_norm")
-        ranked: list[tuple[UUID, float]] = []
-        for row, _meme in self._legacy_rows(model):
-            try:
-                candidate = [float(item) for item in row.embedding or []]
-                candidate_norm = math.sqrt(sum(item * item for item in candidate))
-                if len(candidate) != EMBEDDING_DIMENSIONS or not math.isfinite(candidate_norm) or candidate_norm <= 0:
-                    continue
-                score = sum(left * right for left, right in zip(values, candidate)) / (norm * candidate_norm)
-            except (TypeError, ValueError, ZeroDivisionError):
-                continue
-            ranked.append((row.meme_id, float(score)))
-        ranked.sort(key=lambda item: (-item[1], str(item[0])))
-        return ranked[: max(1, min(int(limit), 100))]
+        # query_incremental 是内部已通过来源门禁的执行函数；在这里直接分派，
+        # 避免同一请求重复探测 migration state。
+        return self.query_incremental(normalized_model, vector, limit)
 
     def query_incremental(self, model: str, vector: Sequence[float], limit: int = 5) -> list[tuple[UUID, float]]:
         """让 pgvector 在数据库内完成当前有效向量的有界余弦排序。"""
@@ -515,23 +539,11 @@ class SearchRepository:
         norm = math.sqrt(sum(value * value for value in values))
         if not math.isfinite(norm) or norm <= 0:
             raise DatabaseError("embedding_zero_norm")
-        state = self.migration_state(model) if hasattr(self, "session") else None
-        if state is not None and state.mode != "incremental_only":
+        if not isinstance(model, str) or not model.strip():
             raise DatabaseError("cache_not_ready")
+        model = model.strip()
         if not hasattr(self, "session"):
-            ranked: list[tuple[UUID, float]] = []
-            for row, meme in self._incremental_rows(model):
-                candidate = [float(item) for item in row.embedding or []]
-                if len(candidate) != EMBEDDING_DIMENSIONS:
-                    continue
-                candidate_norm = math.sqrt(sum(item * item for item in candidate))
-                if not math.isfinite(candidate_norm) or candidate_norm <= 0:
-                    continue
-                ranked.append((meme.id, sum(left * right for left, right in zip(values, candidate)) / (norm * candidate_norm)))
-            ranked.sort(key=lambda item: (-item[1], str(item[0])))
-            if not ranked:
-                raise DatabaseError("cache_not_ready")
-            return ranked[: max(1, min(int(limit), 100))]
+            raise DatabaseError("cache_not_ready")
         distance = MemeTextEmbedding.embedding.cosine_distance(values).label("distance")
         rows = self.session.execute(
             select(Meme.id, distance)

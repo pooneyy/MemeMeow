@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from backend.image_naming import content_addressed_key, normalize_display_name, normalize_extension
 from backend.paths import SUPPORTED_EXTENSIONS, validate_business_storage_key
 from backend.storage_security import StorageRootError, validate_controlled_root
 from backend.persistence.engine import DatabaseError, SCOPE_LOCAL
@@ -240,15 +243,55 @@ class StorageCoordinator:
         return hashlib.sha256(title.encode("utf-8")).hexdigest()
 
     @contextmanager
-    def _transaction(self) -> Iterator[Session]:
-        """创建当前 scope 的短数据库事务，并在退出时提交或回滚。"""
-        with self.resources.factory() as session:
-            self._session = session
+    def _transaction(self, session: Session | None = None) -> Iterator[Session]:
+        """创建当前 scope 的短数据库事务，可选复用已持有身份锁的 Session。"""
+        owned_session = session is None
+        transaction_session = session if session is not None else self.resources.factory()
+        self._session = transaction_session
+        try:
+            with transaction_session.begin():
+                yield transaction_session
+        finally:
+            self._session = None
+            if owned_session:
+                transaction_session.close()
+
+    @contextmanager
+    def _identity_lock(self, digest: str, extension: str) -> Iterator[Session | None]:
+        """在 PostgreSQL 中锁定当前 scope 的图片内容身份直到文件操作完成。
+
+        上传会先提交 Meme 和 prepared operation，再执行文件落位；仅使用事务锁会在
+        这两个动作之间留下重复上传的可见窗口。Session 级 advisory lock 跨越两个短
+        事务，并复用同一连接，因此连接池只有一个可用连接时也不会自相等待。非
+        PostgreSQL 的替身资源不执行数据库专属锁，保持离线单元测试的可用性。
+        """
+        dialect = getattr(getattr(getattr(self.resources, "engine", None), "dialect", None), "name", None)
+        if dialect != "postgresql":
+            yield None
+            return
+
+        # Session-level advisory lock 绑定到显式 Connection。SQLAlchemy Session 在
+        # commit 后会把连接归还连接池；若让解锁重新 checkout 连接，可能在另一条
+        # PostgreSQL 会话上执行 pg_advisory_unlock，从而把原锁永久留在池中。
+        lock_connection = self.resources.engine.connect()
+        lock_session = Session(bind=lock_connection, expire_on_commit=False)
+        lock_key = f"mememeow:upload:{self.scope.scope_id}:{digest}:{extension}"
+        acquired = False
+        try:
+            lock_connection.execute(text("SELECT pg_advisory_lock(hashtext(:key))"), {"key": lock_key})
+            lock_connection.commit()
+            acquired = True
+            yield lock_session
+        finally:
             try:
-                with session.begin():
-                    yield session
+                if acquired:
+                    lock_connection.execute(text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": lock_key})
+                    lock_connection.commit()
+                else:
+                    lock_connection.rollback()
             finally:
-                self._session = None
+                lock_session.close()
+                lock_connection.close()
 
     @staticmethod
     def _thumbnail_keys(operation: StorageOperation) -> list[str]:
@@ -423,33 +466,100 @@ class StorageCoordinator:
         keys.extend(self._thumbnail_file_keys(record.id, str(record.sha256)))
         return list(dict.fromkeys(keys))
 
-    def upload(self, content: bytes, *, target_key: str, extension: str, context: dict[str, Any], provenance: dict[str, Any], meme_id: UUID | None = None) -> Meme:
-        """暂存上传字节、创建 pending Meme，并在文件落位后完成 durable operation。"""
-        try:
-            validate_business_storage_key(target_key)
-        except ValueError as exc:
-            raise DatabaseError(str(exc)) from exc
-        target = self.blob_store._key_path(target_key)
-        if target.exists() or target.is_symlink():
-            raise DatabaseError("target_exists")
-        digest = hashlib.sha256(content).hexdigest()
+    def _upload_durable(
+        self,
+        content: bytes,
+        *,
+        digest: str,
+        normalized_extension: str,
+        normalized_display_name: str,
+        context: dict[str, Any],
+        provenance: dict[str, Any],
+        status: str,
+        extensions: dict[str, Any] | None,
+        meme_id: UUID | None,
+        lock_session: Session | None,
+    ) -> Meme:
+        """在内容身份锁内完成 Meme、文件和 storage operation 的 durable 收束。"""
+        physical_key = content_addressed_key(digest, normalized_extension)
+        target = self.blob_store._key_path(physical_key)
         token = uuid.uuid4()
-        staging_key = self.blob_store.stage_bytes(content, token=token)
+        staging_key: str | None = None
         try:
-            with self._transaction() as session:
-                existing = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.storage_key == target_key).with_for_update())
+            # 暂存先于数据库写入，避免把请求缓冲直接暴露为可见文件；身份锁会让并发
+            # 请求在首个请求完成文件落位后再读取 durable 事实。
+            if target.exists() or target.is_symlink():
+                with self._transaction(lock_session) as session:
+                    existing = session.scalar(
+                        select(Meme)
+                        .where(
+                            Meme.scope_id == self.scope.scope_id,
+                            Meme.sha256 == digest,
+                            Meme.extension == normalized_extension,
+                        )
+                        .with_for_update()
+                    )
+                    if existing is None or existing.storage_key != physical_key:
+                        raise DatabaseError("upload_reconciliation_required")
+                    if not self.blob_store.exists_with_identity(physical_key, sha256=digest, size_bytes=len(content)):
+                        raise DatabaseError("upload_reconciliation_required")
+                    return existing
+
+            staging_key = self.blob_store.stage_bytes(content, token=token)
+            with self._transaction(lock_session) as session:
+                existing = session.scalar(
+                    select(Meme)
+                    .where(
+                        Meme.scope_id == self.scope.scope_id,
+                        Meme.sha256 == digest,
+                        Meme.extension == normalized_extension,
+                    )
+                    .with_for_update()
+                )
                 if existing is not None:
-                    raise DatabaseError("target_exists")
+                    if existing.storage_key != physical_key or not self.blob_store.exists_with_identity(physical_key, sha256=digest, size_bytes=len(content)):
+                        raise DatabaseError("upload_reconciliation_required")
+                    if staging_key is not None and self.blob_store.exists_with_identity(staging_key, sha256=digest, size_bytes=len(content)):
+                        self.blob_store.unlink(staging_key)
+                    return existing
+
                 from backend.metadata import MemeContext, semantic_document_hash
 
                 parsed_context = MemeContext.model_validate(context)
-                record = Meme(id=meme_id or uuid.uuid4(), scope_id=self.scope.scope_id, storage_key=target_key, extension=extension.lower(), size_bytes=len(content), sha256=digest, context_status="pending", search_metadata_hash=semantic_document_hash(parsed_context), meme_context=parsed_context.model_dump(mode="json", exclude_none=False), provenance=provenance, extensions={}, revision=1)
+                record = Meme(
+                    id=meme_id or uuid.uuid4(),
+                    scope_id=self.scope.scope_id,
+                    storage_key=physical_key,
+                    display_name=normalized_display_name,
+                    extension=normalized_extension,
+                    size_bytes=len(content),
+                    sha256=digest,
+                    context_status=status,
+                    search_metadata_hash=semantic_document_hash(parsed_context),
+                    meme_context=parsed_context.model_dump(mode="json", exclude_none=False),
+                    provenance=provenance,
+                    extensions=dict(extensions or {}),
+                    revision=1,
+                )
                 session.add(record)
                 session.flush()
-                session.add(StorageOperation(scope_id=self.scope.scope_id, meme_id=record.id, operation_type="upload", operation_token=token, target_key=target_key, staging_key=staging_key, after_sha256=digest, after_size=len(content), status="prepared"))
+                session.add(
+                    StorageOperation(
+                        scope_id=self.scope.scope_id,
+                        meme_id=record.id,
+                        operation_type="upload",
+                        operation_token=token,
+                        target_key=physical_key,
+                        staging_key=staging_key,
+                        after_sha256=digest,
+                        after_size=len(content),
+                        status="prepared",
+                    )
+                )
                 session.flush()
-            self.blob_store.link_move(staging_key, target_key)
-            with self._transaction() as session:
+
+            self.blob_store.link_move(staging_key, physical_key)
+            with self._transaction(lock_session) as session:
                 operation = session.scalar(
                     select(StorageOperation)
                     .where(
@@ -464,56 +574,212 @@ class StorageCoordinator:
                 self._set_status(operation, "file_applied", session=session)
                 self._set_status(operation, "completed", session=session)
             return record
+        except IntegrityError as exc:
+            # 内容唯一键可能在本事务之外刚刚被并发请求提交；HTTP 层会重新读取
+            # by_content 事实并把已完成写入收束成幂等成功。
+            raise DatabaseError("target_exists") from exc
         except Exception:
             # 暂存文件没有数据库引用时可以安全清理；已写入 operation 的异常留给恢复器。
-            try:
-                if self.blob_store.exists_with_identity(staging_key, sha256=digest, size_bytes=len(content)):
-                    self.blob_store.unlink(staging_key)
-            except DatabaseError:
-                pass
+            if staging_key is not None:
+                try:
+                    if self.blob_store.exists_with_identity(staging_key, sha256=digest, size_bytes=len(content)):
+                        self.blob_store.unlink(staging_key)
+                except DatabaseError:
+                    pass
             raise
 
-    def rename(self, meme_id: UUID | str, *, target_key: str) -> Meme:
-        """记录重命名意图、原子移动文件并提交同一 Meme 的新 storage_key。"""
+    def upload(
+        self,
+        content: bytes,
+        *,
+        target_key: str | None = None,
+        extension: str | None = None,
+        display_name: str | None = None,
+        context: dict[str, Any],
+        provenance: dict[str, Any],
+        status: str = "pending",
+        extensions: dict[str, Any] | None = None,
+        meme_id: UUID | None = None,
+    ) -> Meme:
+        """以内容寻址 key durable 写入上传，并按内容身份实现 scope 内幂等。
+
+        `target_key` 保留为旧调用方传入的用户文件名；它只用于提取展示名称和扩展名，
+        不再作为物理路径。最终 SHA、扩展名和展示名在同一事务中确定，文件操作仍通过
+        `StorageOperation` 记录，供并发上传和进程崩溃后的恢复器收束。`status` 和
+        `extensions` 仅供受控迁移保留已验证语境，普通上传使用默认值。
+        """
+        requested_key = target_key
+        if requested_key is not None:
+            try:
+                validate_business_storage_key(requested_key)
+            except ValueError as exc:
+                raise DatabaseError(str(exc)) from exc
         try:
-            validate_business_storage_key(target_key)
+            normalized_extension = normalize_extension(extension or (Path(requested_key).suffix if requested_key else None))
+            normalized_display_name = normalize_display_name(
+                display_name if display_name is not None else Path(requested_key).stem if requested_key else "image"
+            )
         except ValueError as exc:
             raise DatabaseError(str(exc)) from exc
-        token = uuid.uuid4()
+        if status not in {"pending", "partial", "ready", "repair_required"}:
+            raise DatabaseError("invalid_context_status")
+        if extensions is not None and not isinstance(extensions, dict):
+            raise DatabaseError("extensions_invalid")
+
+        digest = hashlib.sha256(content).hexdigest()
+        with self._identity_lock(digest, normalized_extension) as lock_session:
+            return self._upload_durable(
+                content,
+                digest=digest,
+                normalized_extension=normalized_extension,
+                normalized_display_name=normalized_display_name,
+                context=context,
+                provenance=provenance,
+                status=status,
+                extensions=extensions,
+                meme_id=meme_id,
+                lock_session=lock_session,
+            )
+
+    def rename(self, meme_id: UUID | str, *, target_key: str | None = None, display_name: str | None = None) -> Meme:
+        """只更新 Meme 展示名称，保留不可变物理 key 和图片 revision。"""
+        if display_name is None:
+            if target_key is None:
+                raise DatabaseError("display_name_required")
+            try:
+                validate_business_storage_key(target_key)
+            except ValueError as exc:
+                raise DatabaseError(str(exc)) from exc
+            display_name = Path(target_key).stem
+        try:
+            normalized_name = normalize_display_name(display_name)
+        except ValueError as exc:
+            raise DatabaseError(str(exc)) from exc
+        try:
+            identifier = UUID(str(meme_id))
+        except (TypeError, ValueError) as exc:
+            raise DatabaseError("meme_not_found") from exc
         with self._transaction() as session:
-            record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))).with_for_update())
+            record = session.scalar(
+                select(Meme)
+                .where(Meme.scope_id == self.scope.scope_id, Meme.id == identifier)
+                .with_for_update()
+            )
             if record is None:
                 raise DatabaseError("meme_not_found")
-            if session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.storage_key == target_key, Meme.id != record.id)) is not None:
-                raise DatabaseError("target_exists")
-            target_path = self.blob_store._key_path(target_key)
-            if target_path.exists() or target_path.is_symlink():
-                raise DatabaseError("target_exists")
-            operation = StorageOperation(scope_id=self.scope.scope_id, meme_id=record.id, operation_type="rename", operation_token=token, source_key=record.storage_key, target_key=target_key, before_sha256=record.sha256, after_sha256=record.sha256, before_size=record.size_bytes, after_size=record.size_bytes, status="prepared")
-            session.add(operation)
+            record.display_name = normalized_name
+            record.updated_at = utcnow()
             session.flush()
+            return record
+
+    def _rename_if_current_display_name(
+        self,
+        meme_id: UUID | str,
+        *,
+        target_key: str,
+        expected_source_key: str,
+        expected_sha256: str,
+        expected_revision: int,
+        task_id: str,
+        claim_generation: int,
+        attempt: int,
+        claim_owner: str,
+        expected_title_fingerprint: str | None = None,
+        expected_display_name: str | None = None,
+    ) -> Meme:
+        """在自动命名 claim 内只提交展示名，保留图片物理身份不变。
+
+        `expected_display_name` 是任务创建时观察到的用户可见名称；提供时会一并
+        参与 CAS，用于防止排队期间的人工重命名被自动命名覆盖。历史调用方省略
+        该字段时仍保留原有图片身份校验。
+        """
         try:
-            self.blob_store.link_move(record.storage_key, target_key)
-        except Exception:
-            raise
+            validate_business_storage_key(target_key)
+            validate_business_storage_key(expected_source_key)
+        except ValueError as exc:
+            raise DatabaseError("invalid_filename") from exc
+        if (
+            not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+            or any(char not in "0123456789abcdefABCDEF" for char in expected_sha256)
+            or not isinstance(task_id, str)
+            or not task_id
+            or not isinstance(claim_owner, str)
+            or not claim_owner
+            or type(expected_revision) is not int
+            or expected_revision < 1
+            or type(claim_generation) is not int
+            or claim_generation < 1
+            or type(attempt) is not int
+            or attempt < 1
+        ):
+            raise DatabaseError("target_changed")
+        if Path(target_key).suffix.lower() != Path(expected_source_key).suffix.lower():
+            raise DatabaseError("invalid_filename")
+        try:
+            normalized_name = normalize_display_name(Path(target_key).stem)
+            identifier = UUID(str(meme_id))
+        except (TypeError, ValueError) as exc:
+            raise DatabaseError("target_changed") from exc
+        if expected_display_name is not None:
+            try:
+                expected_display_name = normalize_display_name(expected_display_name)
+            except ValueError as exc:
+                raise DatabaseError("target_changed") from exc
         with self._transaction() as session:
-            operation = session.scalar(
+            record = session.scalar(
+                select(Meme)
+                .where(Meme.scope_id == self.scope.scope_id, Meme.id == identifier)
+                .with_for_update()
+            )
+            task = session.scalar(
+                select(Task)
+                .where(Task.scope_id == self.scope.scope_id, Task.id == task_id)
+                .with_for_update()
+            )
+            now = utcnow()
+            if (
+                task is None
+                or task.task_type != "image_auto_rename"
+                or task.image_stage != "auto_rename"
+                or task.status != "running"
+                or task.claim_generation != claim_generation
+                or task.attempt_count != attempt
+                or task.lease_expires_at is None
+                or task.lease_expires_at <= now
+                or task.lease_owner != claim_owner
+            ):
+                raise DatabaseError("claim_expired")
+            if record is None or record.sha256.lower() != expected_sha256.lower():
+                raise DatabaseError("target_changed")
+            if expected_title_fingerprint is not None and self._title_fingerprint(record) != expected_title_fingerprint:
+                raise DatabaseError("target_changed")
+            if record.storage_key != expected_source_key:
+                raise DatabaseError("storage_key_changed")
+            if expected_display_name is not None and record.display_name != expected_display_name:
+                raise DatabaseError("display_name_changed")
+            if record.revision != expected_revision:
+                raise DatabaseError("target_changed")
+            if not self.blob_store.exists_with_identity(
+                record.storage_key,
+                sha256=record.sha256,
+                size_bytes=record.size_bytes,
+            ):
+                raise DatabaseError("target_changed")
+            unsettled_operation = session.scalar(
                 select(StorageOperation)
                 .where(
                     StorageOperation.scope_id == self.scope.scope_id,
-                    StorageOperation.operation_token == token,
+                    StorageOperation.meme_id == record.id,
+                    StorageOperation.status.in_(("prepared", "file_applied", "blocked")),
                 )
+                .order_by(StorageOperation.updated_at.desc(), StorageOperation.id.desc())
                 .with_for_update()
             )
-            record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))).with_for_update())
-            if operation is None or record is None:
-                raise DatabaseError("storage_operation_missing")
-            self._session = session
-            self._set_status(operation, "file_applied", session=session)
-            record.storage_key = target_key
-            record.revision += 1
+            if unsettled_operation is not None:
+                raise DatabaseError("storage_operation_unknown")
+            record.display_name = normalized_name
             record.updated_at = utcnow()
-            self._set_status(operation, "completed", session=session)
             session.flush()
             return record
 
@@ -530,342 +796,27 @@ class StorageCoordinator:
         attempt: int,
         claim_owner: str,
         expected_title_fingerprint: str | None = None,
+        expected_display_name: str | None = None,
     ) -> Meme:
-        """在任务 claim 与 Meme 事实仍匹配时执行一次 CAS 重命名。
+        """在任务 claim 与 Meme 事实仍匹配时执行一次展示名 CAS 更新。
 
-        第一段事务锁定 Meme/Task 并记录 ``StorageOperation``，文件移动完成后第二段
-        事务再次复核所有 fencing 输入。任一复核失败都会阻断操作恢复，避免未知文件
-        副作用被当作普通命名警告；实际 claim owner 必须与当前 Task lease owner 完全
-        一致，不能只依赖 generation 和 attempt。
-
-        ``storage_key_changed`` 只表示同一 SHA 的 Meme 已经被人工改名，调用方可将其
-        降级为 warning；SHA、revision、语境指纹、claim 或文件副作用无法确认时必须
-        保持 blocked/unknown_execution。
+        自动命名不再移动物理文件，也不改变 ``storage_key``、图片 SHA 或图片 revision。
+        仍需复核任务租约、当前图片身份、源 key、标题指纹和 revision，避免过期任务
+        覆盖人工或并发更新；实际文件操作只保留给历史恢复器处理旧 operation。
         """
-        try:
-            validate_business_storage_key(target_key)
-            validate_business_storage_key(expected_source_key)
-        except ValueError as exc:
-            raise DatabaseError("invalid_filename") from exc
-        if (
-            not isinstance(expected_sha256, str)
-            or len(expected_sha256) != 64
-            or any(char not in "0123456789abcdefABCDEF" for char in expected_sha256)
-            or not isinstance(task_id, str)
-            or not task_id
-            or not isinstance(claim_owner, str)
-            or not claim_owner
-            or not isinstance(expected_revision, int)
-            or expected_revision < 1
-            or not isinstance(claim_generation, int)
-            or claim_generation < 1
-            or not isinstance(attempt, int)
-            or attempt < 1
-        ):
-            raise DatabaseError("target_changed")
-
-        def current_title_fingerprint(record: Meme) -> str:
-            """从数据库中的当前标题计算与 handler 一致的输入指纹。"""
-            return self._title_fingerprint(record)
-
-        def mark_blocked(error: str) -> None:
-            """在文件副作用已发生但 finalize 不确定时持久化 blocked。"""
-            try:
-                with self._transaction() as session:
-                    operation = session.scalar(
-                        select(StorageOperation)
-                        .where(
-                            StorageOperation.scope_id == self.scope.scope_id,
-                            StorageOperation.operation_token == token,
-                        )
-                        .with_for_update()
-                    )
-                    if operation is not None and operation.status in self._ACTIVE:
-                        # finalize 失败时不再复用可能已抛错的状态转移 helper，直接
-                        # 持久化 blocked 事实，确保恢复器不会把副作用当作可重放。
-                        operation.status = "blocked"
-                        operation.error = {"error": error}
-                        operation.updated_at = utcnow()
-                        session.flush()
-            except Exception:  # noqa: BLE001 - 数据库本身不可用时保留原始异常
-                return
-
-        def compensate_manual_replacement() -> bool:
-            """识别文件移动前同图手动改名，并安全结束未执行的操作。"""
-            try:
-                with self._transaction() as session:
-                    operation = session.scalar(
-                        select(StorageOperation)
-                        .where(
-                            StorageOperation.scope_id == self.scope.scope_id,
-                            StorageOperation.operation_token == token,
-                        )
-                        .with_for_update()
-                    )
-                    record = session.scalar(
-                        select(Meme)
-                        .where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id)))
-                        .with_for_update()
-                    )
-                    if operation is None or operation.status != "prepared" or record is None:
-                        return False
-                    title_matches = expected_title_fingerprint is None or current_title_fingerprint(record) == expected_title_fingerprint
-                    same_image = record.sha256.lower() == expected_sha256.lower()
-                    current_is_target = (
-                        record.storage_key == target_key
-                        and record.revision == expected_revision + 1
-                        and self.blob_store.exists_with_identity(target_key, sha256=expected_sha256, size_bytes=record.size_bytes)
-                    )
-                    current_is_replacement = record.storage_key != source_key and not current_is_target
-                    target_path = self.blob_store._key_path(target_key, must_exist=False)
-                    target_absent = not target_path.exists() and not target_path.is_symlink()
-                    if not (same_image and title_matches and current_is_replacement and target_absent):
-                        if not (same_image and title_matches and current_is_target):
-                            return False
-                    self._set_status(operation, "compensated", error={"error": "storage_key_changed"}, session=session)
-                    return True
-            except Exception:  # noqa: BLE001 - 无法确认时必须保留 unknown 语义
-                return False
-
-        def compensate_unapplied_target_conflict() -> bool:
-            """在目标文件于预检后被占用时补偿尚未发生的文件动作。"""
-            try:
-                with self._transaction() as session:
-                    operation = session.scalar(
-                        select(StorageOperation)
-                        .where(
-                            StorageOperation.scope_id == self.scope.scope_id,
-                            StorageOperation.operation_token == token,
-                        )
-                        .with_for_update()
-                    )
-                    record = session.scalar(
-                        select(Meme)
-                        .where(
-                            Meme.scope_id == self.scope.scope_id,
-                            Meme.id == UUID(str(meme_id)),
-                        )
-                        .with_for_update()
-                    )
-                    if operation is None or operation.status != "prepared" or record is None:
-                        return False
-                    if (
-                        record.storage_key != source_key
-                        or record.revision != expected_revision
-                        or record.sha256.lower() != expected_sha256.lower()
-                        or (expected_title_fingerprint is not None and current_title_fingerprint(record) != expected_title_fingerprint)
-                    ):
-                        return False
-                    source_ok = self.blob_store.exists_with_identity(
-                        source_key,
-                        sha256=expected_sha256,
-                        size_bytes=record.size_bytes,
-                    )
-                    target_path = self.blob_store._key_path(target_key, must_exist=False)
-                    if not source_ok or not target_path.exists() or target_path.is_symlink():
-                        return False
-                    self._set_status(operation, "compensated", error={"error": "target_exists"}, session=session)
-                    return True
-            except Exception:  # noqa: BLE001 - 无法证明未发生副作用时保留未知语义
-                return False
-
-        token = uuid.uuid4()
-        source_key = expected_source_key
-        expected_size: int | None = None
-        try:
-            with self._transaction() as session:
-                record = session.scalar(
-                    select(Meme).where(
-                        Meme.scope_id == self.scope.scope_id,
-                        Meme.id == UUID(str(meme_id)),
-                    ).with_for_update()
-                )
-                task = session.scalar(
-                    select(Task).where(
-                        Task.scope_id == self.scope.scope_id,
-                        Task.id == task_id,
-                    ).with_for_update()
-                )
-                now = utcnow()
-                if (
-                    task is None
-                    or task.task_type != "image_auto_rename"
-                    or task.image_stage != "auto_rename"
-                    or task.status != "running"
-                    or task.claim_generation != claim_generation
-                    or task.attempt_count != attempt
-                    or task.lease_expires_at is None
-                    or task.lease_expires_at <= now
-                    or task.lease_owner != claim_owner
-                ):
-                    raise DatabaseError("claim_expired")
-                if record is None or record.sha256.lower() != expected_sha256.lower():
-                    raise DatabaseError("target_changed")
-                if expected_title_fingerprint is not None and current_title_fingerprint(record) != expected_title_fingerprint:
-                    raise DatabaseError("target_changed")
-                if record.storage_key != expected_source_key:
-                    raise DatabaseError("storage_key_changed")
-                if record.revision != expected_revision:
-                    raise DatabaseError("target_changed")
-                # 同一 Meme 的既有存储操作可能仍有未确认副作用；即使本次派生结果
-                # 与当前文件同名，也不能绕过 blocked/活动操作的 fail-closed 边界。
-                unsettled_operation = session.scalar(
-                    select(StorageOperation)
-                    .where(
-                        StorageOperation.scope_id == self.scope.scope_id,
-                        StorageOperation.meme_id == record.id,
-                        StorageOperation.status.in_(("prepared", "file_applied", "blocked")),
-                    )
-                    .order_by(StorageOperation.updated_at.desc(), StorageOperation.id.desc())
-                    .with_for_update()
-                )
-                if unsettled_operation is not None:
-                    raise DatabaseError("storage_operation_unknown")
-                if target_key == record.storage_key:
-                    # 目标名已经符合派生结果时仍需经过上面的 Task claim/CAS
-                    # 校验和文件身份复核；文件被外部替换时不能把旧路径当作成功。
-                    if not self.blob_store.exists_with_identity(
-                        record.storage_key,
-                        sha256=expected_sha256,
-                        size_bytes=record.size_bytes,
-                    ):
-                        raise DatabaseError("target_changed")
-                    # 复核通过后避免无意义地创建 storage operation。
-                    return record
-                if session.scalar(
-                    select(Meme.id).where(
-                        Meme.scope_id == self.scope.scope_id,
-                        Meme.storage_key == target_key,
-                        Meme.id != record.id,
-                    )
-                ) is not None:
-                    raise DatabaseError("target_exists")
-                target_path = self.blob_store._key_path(target_key)
-                if target_path.exists() or target_path.is_symlink():
-                    raise DatabaseError("target_exists")
-                expected_size = record.size_bytes
-                operation = StorageOperation(
-                    scope_id=self.scope.scope_id,
-                    meme_id=record.id,
-                    operation_type="rename",
-                    operation_token=token,
-                    source_key=record.storage_key,
-                    target_key=target_key,
-                    before_sha256=record.sha256,
-                    after_sha256=record.sha256,
-                    before_size=record.size_bytes,
-                    after_size=record.size_bytes,
-                    expected_revision=expected_revision,
-                    claim_generation=claim_generation,
-                    attempt=attempt,
-                    task_id=task_id,
-                    expected_title_fingerprint=expected_title_fingerprint,
-                    status="prepared",
-                )
-                session.add(operation)
-                session.flush()
-            # 数据库锁不能阻止外部进程替换文件；移动前复核源对象身份，避免把
-            # 同名但不同字节的文件绑定到当前 Meme。
-            if not self.blob_store.exists_with_identity(
-                source_key,
-                sha256=expected_sha256,
-                size_bytes=expected_size,
-            ):
-                mark_blocked("source_identity_changed")
-                raise DatabaseError("target_changed")
-            try:
-                self.blob_store.link_move(source_key, target_key)
-            except (DatabaseError, OSError) as exc:
-                if compensate_manual_replacement():
-                    raise DatabaseError("storage_key_changed") from exc
-                if isinstance(exc, DatabaseError) and exc.code == "target_exists" and compensate_unapplied_target_conflict():
-                    raise DatabaseError("target_exists") from exc
-                # 预检通过后文件动作仍可能在 link/unlink 边界失败；此时不能把
-                # 未知副作用当作普通目标冲突，必须留下 blocked 事实交给恢复器。
-                mark_blocked("rename_file_move_unknown")
-                raise DatabaseError("storage_operation_unknown") from exc
-            try:
-                target_verified = self.blob_store.exists_with_identity(
-                    target_key,
-                    sha256=expected_sha256,
-                    size_bytes=expected_size,
-                )
-                source_path = self.blob_store._key_path(source_key, must_exist=False)
-                source_absent = not source_path.exists() and not source_path.is_symlink()
-            except (DatabaseError, OSError) as exc:
-                mark_blocked("rename_file_identity_unknown")
-                raise DatabaseError("storage_operation_unknown") from exc
-            if not target_verified or not source_absent:
-                mark_blocked("rename_file_identity_mismatch")
-                raise DatabaseError("storage_operation_unknown")
-        except Exception:
-            # ``prepared`` 操作必须交给恢复器判断；不要删除可能已完成的文件移动。
-            raise
-
-        blocked_error: str | None = None
-        try:
-            with self._transaction() as session:
-                operation = session.scalar(
-                    select(StorageOperation)
-                    .where(
-                        StorageOperation.scope_id == self.scope.scope_id,
-                        StorageOperation.operation_token == token,
-                    )
-                    .with_for_update()
-                )
-                record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))).with_for_update())
-                task = session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id).with_for_update())
-                now = utcnow()
-                if operation is None or record is None:
-                    blocked_error = "storage_operation_missing"
-                elif (
-                    task is None
-                    or task.task_type != "image_auto_rename"
-                    or task.image_stage != "auto_rename"
-                    or task.status != "running"
-                    or task.claim_generation != claim_generation
-                    or task.attempt_count != attempt
-                    or task.lease_expires_at is None
-                    or task.lease_expires_at <= now
-                    or task.lease_owner != claim_owner
-                ):
-                    blocked_error = "claim_expired"
-                elif record.sha256.lower() != expected_sha256.lower():
-                    blocked_error = "target_changed"
-                elif expected_title_fingerprint is not None and current_title_fingerprint(record) != expected_title_fingerprint:
-                    blocked_error = "target_changed"
-                elif record.storage_key != expected_source_key:
-                    blocked_error = "storage_key_changed" if record.sha256.lower() == expected_sha256.lower() else "target_changed"
-                elif record.revision != expected_revision:
-                    blocked_error = "target_changed"
-                else:
-                    target_verified = self.blob_store.exists_with_identity(
-                        target_key,
-                        sha256=expected_sha256,
-                        size_bytes=expected_size,
-                    )
-                    source_path = self.blob_store._key_path(source_key, must_exist=False)
-                    if not target_verified or source_path.exists() or source_path.is_symlink():
-                        blocked_error = "rename_file_identity_mismatch"
-                    else:
-                        self._session = session
-                        self._set_status(operation, "file_applied", session=session)
-                        record.storage_key = target_key
-                        record.revision += 1
-                        record.updated_at = utcnow()
-                        self._set_status(operation, "completed", session=session)
-                        session.flush()
-        except Exception as exc:  # noqa: BLE001 - 文件已移动，finalize 异常必须留痕
-            mark_blocked("unknown_execution")
-            raise DatabaseError("storage_operation_unknown") from exc
-        if blocked_error is not None:
-            # 文件已移动但数据库事实无法安全收束，operation 保持 blocked，由恢复/人工
-            # 处置路径保留未知执行证据，调用方不能把它降级为 warning。
-            mark_blocked(blocked_error)
-            raise DatabaseError("storage_operation_unknown")
-        with self.resources.factory() as session:
-            return session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))))
-
+        return self._rename_if_current_display_name(
+            meme_id,
+            target_key=target_key,
+            expected_source_key=expected_source_key,
+            expected_sha256=expected_sha256,
+            expected_revision=expected_revision,
+            task_id=task_id,
+            claim_generation=claim_generation,
+            attempt=attempt,
+            claim_owner=claim_owner,
+            expected_title_fingerprint=expected_title_fingerprint,
+            expected_display_name=expected_display_name,
+        )
     def delete(self, meme_id: UUID | str) -> None:
         """先阻断派生访问并隔离原图，再删除 Meme 记录和派生对象。"""
         token = uuid.uuid4()
@@ -1339,21 +1290,79 @@ class StorageCoordinator:
         counts["completed"] += 1
 
     def flat_preflight(self) -> dict[str, Any]:
-        """只读检查业务 key、嵌套图片和记录/文件一致性，供 migration 与启动门禁使用。"""
-        report: dict[str, Any] = {"non_flat_keys": [], "nested_images": [], "orphan_files": [], "missing_files": [], "mismatched": [], "active_operations": []}
+        """只读检查业务身份、嵌套图片和记录/文件一致性，供 migration 与启动门禁使用。
+
+        返回值按 scope 聚合结构性问题和物理问题。结构性问题会阻断检索重建；原图
+        缺失或指纹漂移只作为报告保留，不能在预检阶段改写 Meme 状态。
+        """
+        report: dict[str, Any] = {
+            "non_flat_keys": [],
+            "invalid_sha256": [],
+            "invalid_extensions": [],
+            "invalid_display_names": [],
+            "non_content_addressed_keys": [],
+            "duplicate_content": [],
+            "nested_images": [],
+            "orphan_files": [],
+            "missing_files": [],
+            "mismatched": [],
+            "active_operations": [],
+        }
         with self.resources.factory() as session:
             records = list(session.scalars(select(Meme).where(Meme.scope_id == self.scope.scope_id)))
             referenced: set[str] = set()
+            content_records: dict[tuple[str, str], str] = {}
             for record in records:
-                referenced.add(record.storage_key)
+                storage_key = record.storage_key if isinstance(record.storage_key, str) else ""
+                if storage_key:
+                    referenced.add(storage_key)
+                record_id = str(record.id)
+                sha256 = record.sha256 if isinstance(record.sha256, str) else ""
+                extension = record.extension if isinstance(record.extension, str) else ""
+                sha_valid = re.fullmatch(r"[0-9a-f]{64}", sha256) is not None
+                extension_valid = extension in SUPPORTED_EXTENSIONS and extension == extension.lower()
+                if not sha_valid:
+                    report["invalid_sha256"].append(record_id)
+                if not extension_valid:
+                    report["invalid_extensions"].append(record_id)
+                display_name = getattr(record, "display_name", None)
                 try:
-                    validate_business_storage_key(record.storage_key)
+                    display_name_valid = isinstance(display_name, str) and normalize_display_name(display_name) == display_name
                 except ValueError:
-                    report["non_flat_keys"].append(record.storage_key)
-                if not self.blob_store.exists_with_identity(record.storage_key):
-                    report["missing_files"].append(str(record.id))
-                elif not self.blob_store.exists_with_identity(record.storage_key, sha256=record.sha256, size_bytes=record.size_bytes):
-                    report["mismatched"].append(str(record.id))
+                    display_name_valid = False
+                if not display_name_valid:
+                    report["invalid_display_names"].append(record_id)
+                try:
+                    validate_business_storage_key(storage_key)
+                except ValueError:
+                    report["non_flat_keys"].append(storage_key or record_id)
+                if not (sha_valid and extension_valid and storage_key == f"{sha256}{extension}"):
+                    report["non_content_addressed_keys"].append(record_id)
+                if sha_valid and extension_valid:
+                    content_identity = (sha256, extension)
+                    previous_id = content_records.get(content_identity)
+                    if previous_id is None:
+                        content_records[content_identity] = record_id
+                    else:
+                        report["duplicate_content"].append(
+                            {
+                                "sha256": sha256,
+                                "extension": extension,
+                                "meme_ids": [previous_id, record_id],
+                            }
+                        )
+                # 无效 key 不能进入 BlobStore 解析器；这既避免把预检异常升级成启动崩溃，
+                # 也确保报告明确区分结构性脏记录与真实文件缺失。
+                try:
+                    storage_key_valid = validate_business_storage_key(storage_key) == storage_key
+                except ValueError:
+                    storage_key_valid = False
+                if not storage_key_valid or not sha_valid or not extension_valid:
+                    continue
+                if not self.blob_store.exists_with_identity(storage_key):
+                    report["missing_files"].append(record_id)
+                elif not self.blob_store.exists_with_identity(storage_key, sha256=sha256, size_bytes=record.size_bytes):
+                    report["mismatched"].append(record_id)
             for path in self.blob_store.root.rglob("*"):
                 if not path.is_file() or path.is_symlink() or path.is_relative_to(self.blob_store.staging_root) or path.is_relative_to(self.blob_store.quarantine_root):
                     continue

@@ -166,7 +166,7 @@ async def generate_context_batch(
             state = service(request, "metadata").status(image)["status"]
             # include_unready=False 时保持原语义：已就绪记录只返回 skip，不重新创建 Job。
             if not payload.include_unready and state not in {"pending", "partial", "repair_required"}:
-                results.append({"meme_id": meme_id, "skipped": "already_ready"})
+                results.append({"meme_id": meme_id, "skipped": "already_ready", "category": "not_needed", "reason": "already_ready"})
                 continue
             if state == "repair_required":
                 service(request, "metadata").create_pending(image)
@@ -179,12 +179,28 @@ async def generate_context_batch(
                 explicit_retry=payload.include_unready,
                 schedule=True,
             )
-            result = _job_result(snapshot)
-            result["meme_id"] = meme_id
+            if payload.include_unready:
+                result = {"meme_id": meme_id, "category": "submitted", "processing_job_id": snapshot.job_id}
+            else:
+                result = _job_result(snapshot)
+                result["meme_id"] = meme_id
             results.append(result)
+        except ImageProcessingError as exc:
+            if exc.code == "image_processing_active":
+                results.append({"meme_id": meme_id, "category": "processing_active", "reason": exc.code})
+            elif exc.code == "already_ready":
+                results.append({"meme_id": meme_id, "category": "not_needed", "reason": "already_ready"})
+            else:
+                failed = {"meme_id": meme_id, "category": "failed", "reason": exc.code}
+                if not payload.include_unready:
+                    failed["error"] = exc.code
+                results.append(failed)
         except (HTTPException, MetadataError, OSError, RuntimeError) as exc:
             error_code = enqueue_error(exc) if isinstance(exc, RuntimeError) else getattr(exc, "code", "context_enqueue_failed")
-            results.append({"meme_id": meme_id, "error": error_code})
+            failed = {"meme_id": meme_id, "category": "failed", "reason": error_code}
+            if not payload.include_unready:
+                failed["error"] = error_code
+            results.append(failed)
     return {"batch_id": batch_id, "results": results}
 
 

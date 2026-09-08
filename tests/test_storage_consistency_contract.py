@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -131,6 +132,72 @@ def test_storage_coordinator_status_machine_is_fail_closed() -> None:
 
     with pytest.raises(DatabaseError, match="invalid_storage_transition"):
         coordinator._set_status(operation, "prepared")
+
+
+def test_flat_preflight_reports_structural_identity_errors_without_resolving_bad_keys(tmp_path: Path) -> None:
+    """预检必须报告名称/内容重复和非法 key，并对脏 key 保持只读不抛异常。"""
+    payload = b"preflight-content"
+    digest = __import__("hashlib").sha256(payload).hexdigest()
+    store = BlobStore(root=tmp_path / "images", scope=ScopeContext("local"), local=True)
+    (store.root / f"{digest}.png").write_bytes(payload)
+    records = [
+        SimpleNamespace(
+            id="valid",
+            storage_key=f"{digest}.png",
+            display_name="valid",
+            sha256=digest,
+            extension=".png",
+            size_bytes=len(payload),
+        ),
+        SimpleNamespace(
+            id="duplicate",
+            storage_key=f"{digest}.png",
+            display_name="bad/name",
+            sha256=digest,
+            extension=".png",
+            size_bytes=len(payload),
+        ),
+        SimpleNamespace(
+            id="invalid-key",
+            storage_key=None,
+            display_name=None,
+            sha256="not-a-sha",
+            extension=".bmp",
+            size_bytes=0,
+        ),
+    ]
+
+    class Session:
+        """按查询顺序提供 Meme 记录和空 operation 结果。"""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def scalars(self, _statement):
+            self.calls += 1
+            return records if self.calls == 1 else []
+
+    class Resources:
+        """提供预检所需的最小数据库 Session 工厂。"""
+
+        @contextmanager
+        def factory(self):
+            yield Session()
+
+    coordinator = object.__new__(StorageCoordinator)
+    coordinator.resources = Resources()
+    coordinator.scope = ScopeContext("local")
+    coordinator.blob_store = store
+
+    report = coordinator.flat_preflight()
+
+    assert report["invalid_display_names"] == ["duplicate", "invalid-key"]
+    assert report["invalid_sha256"] == ["invalid-key"]
+    assert report["invalid_extensions"] == ["invalid-key"]
+    assert report["non_content_addressed_keys"] == ["invalid-key"]
+    assert report["duplicate_content"] == [{"sha256": digest, "extension": ".png", "meme_ids": ["valid", "duplicate"]}]
+    assert report["missing_files"] == []
+    assert report["mismatched"] == []
 
 
 def test_storage_recovery_code_retains_blocked_unknown_and_skip_locked_guards() -> None:

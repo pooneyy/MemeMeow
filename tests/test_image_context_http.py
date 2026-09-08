@@ -224,6 +224,47 @@ def test_context_batch_forwards_both_processing_options_to_each_job() -> None:
     }]
 
 
+def test_context_batch_reports_active_image_without_reusing_its_job() -> None:
+    """选中图片完整重试遇到活动图片时只报告该图片冲突。"""
+    request = _request()
+
+    class Metadata:
+        """提供两张均未就绪的当前 scope 图片。"""
+
+        def image_for_meme(self, meme_id: str) -> tuple[SimpleNamespace, str]:
+            """返回当前目标和受控路径。"""
+            return SimpleNamespace(id=meme_id), f"/{meme_id}.webp"
+
+        def status(self, _image: str) -> dict[str, str]:
+            """让两项都进入完整重试分支。"""
+            return {"status": "pending"}
+
+    def submit(_request: object, record: SimpleNamespace, _image: str, **_kwargs: object) -> SimpleNamespace:
+        """模拟一张图片冲突、另一张图片成功创建新 Job。"""
+        if record.id == "active":
+            raise ImageProcessingError("image_processing_active")
+        return _snapshot("job-idle")
+
+    payload = image_context_http.ContextBatchRequest.model_validate(
+        {"items": [{"meme_id": "active"}, {"meme_id": "idle"}], "include_unready": True}
+    )
+    result = asyncio.run(
+        image_context_http.generate_context_batch(
+            request,
+            payload,
+            service=lambda _request, _name: Metadata(),
+            submit_processing_job=submit,
+            error=_error,
+            enqueue_error=lambda _exc: "context_enqueue_failed",
+        )
+    )
+
+    assert result["results"] == [
+        {"meme_id": "active", "category": "processing_active", "reason": "image_processing_active"},
+        {"meme_id": "idle", "category": "submitted", "processing_job_id": "job-idle"},
+    ]
+
+
 def test_visual_batch_keeps_following_items_after_failure() -> None:
     """视觉批量一项失败后仍提交后续有效项。"""
     request = _request()

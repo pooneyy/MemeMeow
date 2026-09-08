@@ -33,9 +33,9 @@ def _row(name: str = "工作") -> SimpleNamespace:
     return SimpleNamespace(id=uuid4(), name=name, created_at=now, updated_at=now)
 
 
-def _meme(storage_key: str = "cat.png") -> SimpleNamespace:
+def _meme(storage_key: str = "cat.png", display_name: str = "cat") -> SimpleNamespace:
     """构造合集详情所需的当前 scope Meme 行替身。"""
-    return SimpleNamespace(id=uuid4(), storage_key=storage_key, extension=".png", size_bytes=12)
+    return SimpleNamespace(id=uuid4(), storage_key=storage_key, display_name=display_name, extension=".png", size_bytes=12)
 
 
 class _Collections:
@@ -180,14 +180,25 @@ def test_collection_list_projects_cover_and_rejects_query_selector() -> None:
 def test_collection_detail_projects_current_member_file_and_metadata() -> None:
     """合集详情使用稳定 Meme ID、当前文件名、媒体地址和 scope metadata 状态。"""
     row = _row()
-    member = _meme("renamed.png")
+    member = _meme("a" * 64 + ".png", "renamed")
     repository = _Collections(row, member)
     environment = _Environment(repository)
-    image = Path("/scope/renamed.png")
+    image = Path("/scope/" + member.storage_key)
     metadata = SimpleNamespace(blob_store=SimpleNamespace(resolve=lambda key: image), status=lambda path: {"status": "ready", "path": str(path)})
     result = asyncio.run(collection_http.get_collection(_request(), str(row.id), page=1, page_size=50, environment=lambda _request: environment, metadata_service=lambda _request: metadata, error=_error))
     assert result["total"] == 1
-    assert result["members"] == [{"meme_id": str(member.id), "filename": "renamed.png", "extension": ".png", "size": 12, "media_url": f"/media/{member.id}", "metadata": {"status": "ready", "path": str(image)}}]
+    assert result["members"] == [
+        {
+            "meme_id": str(member.id),
+            "display_name": "renamed",
+            "filename": "renamed.png",
+            "saved_filename": "renamed.png",
+            "extension": ".png",
+            "size": 12,
+            "media_url": f"/media/{member.id}",
+            "metadata": {"status": "ready", "path": str(image)},
+        }
+    ]
 
 
 @pytest.mark.parametrize("operation", ["create", "rename", "delete", "add", "remove"])

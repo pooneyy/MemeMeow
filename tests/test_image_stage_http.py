@@ -114,11 +114,16 @@ def test_job_reads_use_the_injected_scope_repository_once() -> None:
         calls.append(("service", received, name))
         assert received is request
         assert name == "metadata"
-        return SimpleNamespace(image_for_meme=lambda meme_id: (SimpleNamespace(id=meme_id), Path("/runtime/sample.png")))
+        return SimpleNamespace(
+            image_for_meme=lambda meme_id: (
+                SimpleNamespace(id=meme_id, display_name="sample", extension=".png"),
+                Path("/runtime/sample.png"),
+            )
+        )
 
     detail = asyncio.run(image_stage_http.get_image_processing_job(request, "job-1", service=service, error=_error, processing_repository=repository_factory))
     listing = asyncio.run(image_stage_http.list_image_processing_jobs(request, limit=7, service=service, processing_repository=repository_factory))
-    expected = {"job_id": "job-1", "meme_id": "meme-1", "status": "queued", "image": {"meme_id": "meme-1", "filename": "sample.png", "saved_filename": "sample.png", "media_url": "/media/meme-1"}}
+    expected = {"job_id": "job-1", "meme_id": "meme-1", "status": "queued", "image": {"meme_id": "meme-1", "display_name": "sample", "filename": "sample.png", "saved_filename": "sample.png", "media_url": "/media/meme-1"}}
     assert detail == expected
     assert listing == {"items": [expected], "next_cursor": None}
     assert calls == [
@@ -147,6 +152,32 @@ def test_job_image_summary_keeps_identifier_when_image_is_unreadable() -> None:
 
     assert result["image"] == {"meme_id": "meme-1"}
     assert "/" not in str(result["image"])
+
+
+def test_job_image_summary_never_falls_back_to_content_key() -> None:
+    """展示字段缺失时任务摘要省略文件名，不公开内容寻址物理 key。"""
+    request = _request()
+    digest = "a" * 64
+    repository = SimpleNamespace(snapshot=lambda _job_id: _snapshot("job-1"))
+    service = lambda _request, _name: SimpleNamespace(
+        image_for_meme=lambda meme_id: (
+            SimpleNamespace(id=meme_id, storage_key=f"{digest}.png", sha256=digest, extension=".png"),
+            Path(f"{digest}.png"),
+        )
+    )
+
+    result = asyncio.run(
+        image_stage_http.get_image_processing_job(
+            request,
+            "job-1",
+            service=service,
+            error=_error,
+            processing_repository=lambda _request: repository,
+        )
+    )
+
+    assert result["image"] == {"meme_id": "meme-1", "media_url": "/media/meme-1"}
+    assert digest not in str(result)
 
 
 def test_retry_creates_new_revision_without_reactivating_old_job() -> None:
@@ -195,7 +226,12 @@ def test_retry_creates_new_revision_without_reactivating_old_job() -> None:
         image_stage_http.retry_image_processing_job(
             request,
             "old-job",
-            service=lambda _request, _name: SimpleNamespace(image_for_meme=lambda meme_id: (SimpleNamespace(id=meme_id), Path("sample.png"))),
+            service=lambda _request, _name: SimpleNamespace(
+                image_for_meme=lambda meme_id: (
+                    SimpleNamespace(id=meme_id, display_name="sample", extension=".png"),
+                    Path("sample.png"),
+                )
+            ),
             error=_error,
             processing_repository=lambda received: calls.append(("repository", received)) or Repository(),
             processing_worker=lambda received: calls.append(("worker", received)) or Worker(),
@@ -203,7 +239,7 @@ def test_retry_creates_new_revision_without_reactivating_old_job() -> None:
             processing_config=lambda received: calls.append(("config", received)) or {"version": "new"},
         )
     )
-    assert result == {"job_id": "new-job", "meme_id": "meme-1", "status": "queued", "image": {"meme_id": "meme-1", "filename": "sample.png", "saved_filename": "sample.png", "media_url": "/media/meme-1"}}
+    assert result == {"job_id": "new-job", "meme_id": "meme-1", "status": "queued", "image": {"meme_id": "meme-1", "display_name": "sample", "filename": "sample.png", "saved_filename": "sample.png", "media_url": "/media/meme-1"}}
     assert [item[0] for item in calls] == ["repository", "get", "normalize", "config", "retry", "worker", "schedule", "snapshot"]
 
 

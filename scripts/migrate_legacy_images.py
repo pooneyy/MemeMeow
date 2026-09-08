@@ -1,8 +1,10 @@
-"""将图片根目录中的旧图片安全登记到 PostgreSQL local scope。
+"""将图片根目录中的旧图片安全导入 PostgreSQL local scope。
 
 该脚本是实施期受控迁移入口，不读取旧任务 JSON、搜索缓存或其他历史状态。
-图片字节保持原位，数据库 Meme 记录作为迁移后的结构化权威；图片后续通过
-现有 ``visual_embedding_generation`` 任务衔接 ``meme_context_generation``。
+合法图片会被导入内容寻址物理 key，数据库 Meme 记录作为迁移后的结构化权威；旧
+图片名只作为展示名来源，导入成功后清理旧图片名。旧 sidecar 不再参与运行时读取，
+并保留在磁盘供人工核对；图片后续通过 ``visual_embedding_generation`` 任务衔接
+``meme_context_generation``。
 """
 
 from __future__ import annotations
@@ -40,8 +42,10 @@ from backend.database import (
     check_database,
     create_engine_for_settings,
 )
+from backend.image_naming import content_addressed_key, normalize_extension
 from backend.metadata import MetadataError, MetadataService, SidecarMetadata
 from backend.paths import SUPPORTED_EXTENSIONS, validate_business_storage_key
+from backend.persistence.storage import StorageCoordinator
 from backend.visual import identity_from_settings
 
 
@@ -194,13 +198,17 @@ def _iter_image_paths(root: Path) -> tuple[list[Path], list[dict[str, str]]]:
 
 
 def _candidate_groups(candidates: Iterable[InspectedImage]) -> tuple[list[InspectedImage], list[dict[str, str]]]:
-    """按 SHA 去重，优先保留有合法 sidecar 的确定性代表文件。"""
-    groups: dict[str, list[InspectedImage]] = defaultdict(list)
+    """按 SHA 和扩展名去重，优先保留有合法 sidecar 的确定性代表文件。
+
+    扩展名属于内容寻址身份的一部分；同一字节分别以 JPG 和 PNG 后缀存在时必须
+    保留为两个候选，避免迁移结果与内容唯一约束冲突。
+    """
+    groups: dict[tuple[str, str], list[InspectedImage]] = defaultdict(list)
     for item in candidates:
-        groups[item.sha256].append(item)
+        groups[(item.sha256, item.extension.lower())].append(item)
     selected: list[InspectedImage] = []
     skipped: list[dict[str, str]] = []
-    for sha256, group in sorted(groups.items()):
+    for (sha256, _extension), group in sorted(groups.items()):
         ordered = sorted(group, key=lambda item: item.storage_key)
         valid_sidecars = [item for item in ordered if item.sidecar is not None]
         chosen = valid_sidecars[0] if valid_sidecars else ordered[0]
@@ -231,77 +239,175 @@ def _existing_records(resources: DatabaseResources, scope_id: str) -> list[Meme]
         return list(session.scalars(select(Meme).where(Meme.scope_id == scope_id)))
 
 
+def _read_verified_content(item: InspectedImage) -> bytes:
+    """重新读取候选图片并确认扫描期间没有发生替换。"""
+    if item.path.is_symlink():
+        raise DatabaseError("source_symlink_changed")
+    try:
+        content = item.path.read_bytes()
+    except OSError as exc:
+        raise DatabaseError("source_unreadable") from exc
+    if len(content) != item.size_bytes or hashlib.sha256(content).hexdigest() != item.sha256:
+        raise DatabaseError("source_changed")
+    return content
+
+
+def _migration_context(item: InspectedImage) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str, str]:
+    """取得迁移记录使用的语境、来源、扩展字段和状态摘要。"""
+    if item.sidecar is not None:
+        context, provenance, extensions = _sidecar_payload(item.sidecar)
+        return context, provenance, extensions, item.sidecar.context_status, "valid"
+    error = item.sidecar_error or "metadata_invalid"
+    return _base_context(), _migration_provenance(error), {}, "repair_required", error
+
+
+def _cleanup_legacy_source(coordinator: StorageCoordinator, item: InspectedImage, physical_key: str) -> tuple[str, str | None]:
+    """在内容寻址对象 durable 后清理旧文件名，并返回可重试的清理状态。
+
+    图片记录和新物理对象一旦提交，就不能为了旧文件删除失败而回滚；已知的文件
+    系统失败会以 pending 状态写入迁移报告，下一次迁移可按同一内容身份继续收束。
+    """
+    if item.storage_key == physical_key:
+        return "not_required", None
+    try:
+        source_valid = coordinator.blob_store.exists_with_identity(
+            item.storage_key,
+            sha256=item.sha256,
+            size_bytes=item.size_bytes,
+        )
+    except (DatabaseError, OSError) as exc:
+        return "pending", getattr(exc, "code", None) or "legacy_cleanup_check_failed"
+    if not source_valid:
+        return "pending", "legacy_source_changed_or_missing"
+    try:
+        coordinator.blob_store.unlink(item.storage_key)
+    except (DatabaseError, OSError) as exc:
+        return "pending", getattr(exc, "code", None) or "legacy_cleanup_failed"
+    return "removed", None
+
+
 def _create_records(resources: DatabaseResources, inspected: list[InspectedImage], *, scope_id: str, dry_run: bool) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """在单个事务中幂等创建 Meme 记录，不触碰已存在图片字节。"""
+    """将候选图片导入内容寻址存储并幂等创建 Meme 记录。
+
+    dry-run 只计算将要写入的物理 key，不构造不符合新约束的临时 ORM 对象；真实
+    导入先由 StorageCoordinator 完成 durable 文件和记录，再清理旧图片名。任一
+    候选在扫描后发生变化只记录单项失败，不影响其它图片。
+    """
     records = _existing_records(resources, scope_id)
-    by_key = {item.storage_key: item for item in records}
-    by_sha: dict[str, Meme] = {}
+    by_key = {item.storage_key: item for item in records if isinstance(item.storage_key, str)}
+    by_content: dict[tuple[str, str], Meme] = {}
     for item in records:
-        by_sha.setdefault(item.sha256, item)
+        try:
+            content_key = (str(item.sha256).lower(), normalize_extension(item.extension))
+        except (TypeError, ValueError):
+            continue
+        by_content.setdefault(content_key, item)
     migrated: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
-    if dry_run:
-        for item in inspected:
-            existing = by_key.get(item.storage_key)
-            if existing is not None:
-                if existing.sha256 == item.sha256 and existing.size_bytes == item.size_bytes:
-                    skipped.append({"path": item.storage_key, "reason": "already_registered", "meme_id": str(existing.id)})
+    coordinator = None if dry_run else StorageCoordinator(resources, scope_id=scope_id)
+    seen_content: set[tuple[str, str]] = set()
+    seen_keys: set[str] = set()
+    for item in inspected:
+        try:
+            extension = normalize_extension(item.extension)
+            physical_key = content_addressed_key(item.sha256, extension)
+        except ValueError as exc:
+            failed.append({"path": item.storage_key, "reason": str(exc)})
+            continue
+        content_identity = (item.sha256.lower(), extension)
+        existing = by_content.get(content_identity)
+        if existing is None and content_identity in seen_content:
+            skipped.append({"path": item.storage_key, "reason": "duplicate_sha256", "duplicate_of": physical_key, "sha256": item.sha256})
+            continue
+        if existing is not None:
+            if (
+                existing.storage_key == physical_key
+                and existing.size_bytes == item.size_bytes
+                and str(existing.sha256).lower() == item.sha256.lower()
+            ):
+                if not dry_run:
+                    assert coordinator is not None
+                    if not coordinator.blob_store.exists_with_identity(physical_key, sha256=item.sha256, size_bytes=item.size_bytes):
+                        failed.append({"path": item.storage_key, "reason": "existing_record_missing_file", "meme_id": str(existing.id), "storage_key": physical_key})
+                        continue
+                    cleanup, cleanup_error = _cleanup_legacy_source(coordinator, item, physical_key)
+                    existing_skip = {"path": item.storage_key, "reason": "already_registered", "meme_id": str(existing.id), "storage_key": physical_key, "legacy_cleanup": cleanup}
+                    if cleanup_error is not None:
+                        existing_skip["legacy_cleanup_error"] = cleanup_error
+                    skipped.append(existing_skip)
                 else:
-                    failed.append({"path": item.storage_key, "reason": "existing_record_mismatch", "meme_id": str(existing.id)})
-                continue
-            duplicate = by_sha.get(item.sha256)
-            if duplicate is not None:
-                skipped.append({"path": item.storage_key, "reason": "duplicate_sha256", "duplicate_of": duplicate.storage_key, "sha256": item.sha256})
-                continue
-            migrated.append({"path": item.storage_key, "sha256": item.sha256, "size_bytes": item.size_bytes, "sidecar": "valid" if item.sidecar else item.sidecar_error})
-            by_sha[item.sha256] = Meme(scope_id=scope_id, storage_key=item.storage_key, sha256=item.sha256, size_bytes=item.size_bytes)
-        return migrated, skipped, failed
-
-    with resources.environment(scope_id) as environment:
-        for item in inspected:
-            existing = by_key.get(item.storage_key)
-            if existing is not None:
-                if existing.sha256 == item.sha256 and existing.size_bytes == item.size_bytes and existing.extension == item.extension:
-                    skipped.append({"path": item.storage_key, "reason": "already_registered", "meme_id": str(existing.id)})
-                else:
-                    failed.append({"path": item.storage_key, "reason": "existing_record_mismatch", "meme_id": str(existing.id)})
-                continue
-            duplicate = by_sha.get(item.sha256)
-            if duplicate is not None:
-                skipped.append({"path": item.storage_key, "reason": "duplicate_sha256", "duplicate_of": duplicate.storage_key, "sha256": item.sha256})
-                continue
-            if item.sidecar is not None:
-                context, provenance, extensions = _sidecar_payload(item.sidecar)
-                status = item.sidecar.context_status
-                sidecar_status = "valid"
+                    skipped.append({"path": item.storage_key, "reason": "already_registered", "meme_id": str(existing.id), "storage_key": physical_key})
             else:
-                context, provenance, extensions = _base_context(), _migration_provenance(item.sidecar_error or "metadata_invalid"), {}
-                status = "repair_required"
-                sidecar_status = item.sidecar_error or "metadata_invalid"
-            try:
-                with environment.uow.session.begin_nested():
-                    record = environment.memes.create(
-                        storage_key=item.storage_key,
-                        extension=item.extension,
-                        size_bytes=item.size_bytes,
-                        sha256=item.sha256,
-                        context=context,
-                        provenance=provenance,
-                        status=status,
-                        extensions=extensions,
-                    )
-            except (DatabaseError, IntegrityError) as exc:
-                failed.append({"path": item.storage_key, "reason": getattr(exc, "code", "record_create_failed")})
-                continue
-            by_key[item.storage_key] = record
-            by_sha[item.sha256] = record
-            migrated.append({"path": item.storage_key, "meme_id": str(record.id), "sha256": item.sha256, "size_bytes": item.size_bytes, "sidecar": sidecar_status, "context_status": status})
+                failed.append({"path": item.storage_key, "reason": "existing_record_requires_rekey", "meme_id": str(existing.id)})
+            continue
+        occupied = by_key.get(physical_key)
+        if occupied is None and physical_key in seen_keys:
+            skipped.append({"path": item.storage_key, "reason": "duplicate_sha256", "duplicate_of": physical_key, "sha256": item.sha256})
+            continue
+        if occupied is not None:
+            failed.append({"path": item.storage_key, "reason": "storage_key_conflict", "meme_id": str(occupied.id)})
+            continue
+        context, provenance, extensions_payload, status, sidecar_status = _migration_context(item)
+        if dry_run:
+            migrated.append(
+                {
+                    "path": item.storage_key,
+                    "storage_key": physical_key,
+                    "sha256": item.sha256,
+                    "size_bytes": item.size_bytes,
+                    "sidecar": sidecar_status,
+                    "context_status": status,
+                }
+            )
+            # 只保存身份摘要，避免 dry-run 再构造带数据库约束的 Meme 实例。
+            seen_content.add(content_identity)
+            seen_keys.add(physical_key)
+            continue
+        try:
+            content = _read_verified_content(item)
+            assert coordinator is not None
+            record = coordinator.upload(
+                content,
+                target_key=item.storage_key,
+                extension=extension,
+                display_name=Path(item.storage_key).stem,
+                context=context,
+                provenance=provenance,
+                status=status,
+                extensions=extensions_payload,
+            )
+            if (
+                record.storage_key != physical_key
+                or str(record.sha256).lower() != item.sha256.lower()
+                or record.size_bytes != item.size_bytes
+            ):
+                raise DatabaseError("migration_identity_mismatch")
+        except (DatabaseError, IntegrityError, OSError, ValueError) as exc:
+            failed.append({"path": item.storage_key, "reason": getattr(exc, "code", None) or str(exc).split(":", 1)[0]})
+            continue
+        assert coordinator is not None
+        cleanup, cleanup_error = _cleanup_legacy_source(coordinator, item, physical_key)
+        by_content[content_identity] = record
+        by_key[physical_key] = record
+        migrated_item = {
+            "path": item.storage_key,
+            "storage_key": physical_key,
+            "meme_id": str(record.id),
+            "sha256": item.sha256,
+            "size_bytes": item.size_bytes,
+            "sidecar": sidecar_status,
+            "context_status": status,
+            "legacy_cleanup": cleanup,
+        }
+        if cleanup_error is not None:
+            migrated_item["legacy_cleanup_error"] = cleanup_error
+        migrated.append(migrated_item)
     return migrated, skipped, failed
 
 
 def _request_json(url: str, payload: dict[str, Any], *, timeout: float = 15.0) -> dict[str, Any]:
-    """调用现有后端批量视觉任务接口并解析 JSON 响应。"""
+    """调用后端独立视觉阶段批量接口并解析 JSON 响应。"""
     request = urllib.request.Request(
         url.rstrip("/") + "/images/stages/batch",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -499,6 +605,7 @@ def run_migration(args: argparse.Namespace) -> dict[str, Any]:
         report["counts"] = {
             "migrated_images": len(migrated),
             "skipped_duplicates_or_existing": len(duplicate_skips) + len(existing_skips),
+            "legacy_cleanup_pending": sum(1 for item in [*migrated, *existing_skips] if item.get("legacy_cleanup") == "pending"),
             "ignored_non_images_or_internal": len(ignored),
             "rejected_images": len(rejected),
             "record_failures": len(create_failures),

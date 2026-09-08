@@ -7,14 +7,52 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import Column, MetaData, String, Table, create_engine, select
+from sqlalchemy.sql import visitors
 
 from backend.config import Settings
 from backend.database import DatabaseError, _validate_lane_capacities, validate_lane_resource_concurrency, validate_lane_resource_key
 from backend.image_processing import ImageProcessingWorker
 from backend.opencode import OpenCodeRunner
 from backend.pg_services import PostgresTaskService, PostgresTaskWorkerManager
+from backend.persistence.models import Task
+from backend.persistence.repositories.tasks import _exclude_explicit_image_pipeline
+from backend.services.worker_manager import _generic_task_filter
 from executor.agent_limits import validate_agent_concurrency, validate_agent_concurrency_at_most
 from executor.server import _env_agent_concurrency
+
+
+def test_worker_filters_keep_legacy_image_tasks_with_null_submission_mode() -> None:
+    """通用 Worker 的图片排除条件保留来源字段为空的迁移前任务。"""
+    metadata = MetaData()
+    task_table = Table(
+        "tasks",
+        metadata,
+        Column("id", String, primary_key=True),
+        Column("task_type", String, nullable=False),
+        Column("submission_mode", String),
+    )
+    engine = create_engine("sqlite:///:memory:")
+    metadata.create_all(engine)
+    rows = [
+        {"id": "legacy-image", "task_type": "meme_context_generation", "submission_mode": None},
+        {"id": "pipeline-image", "task_type": "meme_context_generation", "submission_mode": "pipeline"},
+        {"id": "standalone-image", "task_type": "image_auto_rename", "submission_mode": "standalone"},
+        {"id": "regular", "task_type": "cache_generation", "submission_mode": None},
+    ]
+    with engine.begin() as connection:
+        connection.execute(task_table.insert(), rows)
+        for predicate in (_generic_task_filter(), _exclude_explicit_image_pipeline()):
+            # 两个 helper 绑定 ORM 表；替换为轻量测试表后执行真实三值逻辑。
+            bound_predicate = visitors.replacement_traverse(
+                predicate,
+                {},
+                lambda element: task_table.c.get(element.name)
+                if getattr(element, "table", None) is Task.__table__
+                else None,
+            )
+            selected = list(connection.scalars(select(task_table.c.id).where(bound_predicate).order_by(task_table.c.id)))
+            assert selected == ["legacy-image", "regular"]
 
 
 def test_postgres_task_layers_preserve_configured_large_capacity() -> None:

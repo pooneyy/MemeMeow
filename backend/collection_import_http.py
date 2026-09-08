@@ -8,6 +8,7 @@ operation policy 收束和异步处理投递。路由注册、当前请求的服
 from __future__ import annotations
 
 from collections.abc import Callable, Collection
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from backend.collection_packages import (
     resolve_import_filename,
 )
 from backend.database import DatabaseError
+from backend.image_naming import is_content_addressed_key, public_filename_fields
 from backend.image_processing import ImageProcessingError
 from backend.image_upload_http import UPLOAD_RESERVATION_RELEASE_ERRORS, _parse_upload_form, _read_upload_content
 from backend.metadata import MetadataError
@@ -47,6 +49,43 @@ UploadContentReader = Callable[..., Any]
 ArchivePreflight = Callable[..., Any]
 FilenameResolver = Callable[..., Any]
 PackageErrorProjector = Callable[[CollectionPackageError], HTTPException]
+
+
+def _public_member_filename(filename: object, sha256: object, extension: object) -> str | None:
+    """返回合集成员的公开输入文件名，过滤与内容身份相同的物理 key。"""
+    if not isinstance(filename, str) or is_content_addressed_key(filename, sha256, extension):
+        return None
+    return filename
+
+
+def _record_filename(record: Any) -> str:
+    """从现有 Meme 记录取得公开文件名，禁止回退到内容寻址 key。"""
+    try:
+        return public_filename_fields(record)["filename"]
+    except ValueError:
+        key = Path(str(getattr(record, "storage_key", "image.png"))).name
+        if is_content_addressed_key(key, getattr(record, "sha256", None), getattr(record, "extension", None)):
+            raise DatabaseError("invalid_display_name")
+        # 旧 facade 的人类文件名仍可用于迁移前兼容，但不会接受哈希物理 key。
+        return key
+
+
+def _record_extension(record: Any, fallback: str) -> str:
+    """读取现有 Meme 的规范扩展名，避免用物理 key 推断内容身份。"""
+    value = getattr(record, "extension", None)
+    return value.lower() if isinstance(value, str) and value else fallback
+
+
+def _resolve_import_target(resolver: FilenameResolver, filename: str, sha256: str, by_name: dict[str, Any], by_content: dict[tuple[str, str], Any]) -> Any:
+    """调用可注入文件名解析器，并兼容尚未升级的三参数 facade。"""
+    try:
+        parameters = inspect.signature(resolver).parameters
+        accepts_content = len(parameters) >= 4 or any(item.kind is inspect.Parameter.VAR_POSITIONAL for item in parameters.values())
+    except (TypeError, ValueError):
+        accepts_content = True
+    if accepts_content:
+        return resolver(filename, sha256, by_name, by_content)
+    return resolver(filename, sha256, by_name)
 
 
 def _thumbnail_enqueue_error(exc: Exception) -> str:
@@ -192,6 +231,7 @@ async def import_collection(
             collection = database_environment.collections.create(collection_name)
             collection_id = collection.id
             existing_by_name: dict[str, object] = {}
+            existing_by_content: dict[tuple[str, str], object] = {}
             scoped_metadata = metadata_service(request)
             for record in database_environment.memes.list_all():
                 valid = scoped_metadata.blob_store.exists_with_identity(
@@ -199,10 +239,16 @@ async def import_collection(
                     sha256=record.sha256,
                     size_bytes=record.size_bytes,
                 )
-                existing_by_name[record.storage_key] = {
+                if not valid:
+                    continue
+                entry = {
                     "meme": record,
-                    "sha256": record.sha256 if valid else "__changed__",
+                    "sha256": str(record.sha256).lower(),
+                    "extension": _record_extension(record, Path(str(record.storage_key)).suffix.lower()),
+                    "display_name": getattr(record, "display_name", None),
                 }
+                existing_by_name[_record_filename(record)] = entry
+                existing_by_content[(str(record.sha256).lower(), entry["extension"])] = entry
     except DatabaseError as exc:
         raise database_error(exc) from exc
 
@@ -213,11 +259,13 @@ async def import_collection(
         member = package_member.manifest
         result: dict[str, object] = {
             "source_meme_id": member.source_meme_id,
-            "filename": member.filename_at_export,
             "ok": False,
         }
+        public_input_filename = _public_member_filename(member.filename_at_export, member.sha256, getattr(member, "extension", Path(member.filename_at_export).suffix))
+        if public_input_filename is not None:
+            result["filename"] = public_input_filename
         try:
-            target = resolve_target(member.filename_at_export, member.sha256, existing_by_name)
+            target = _resolve_import_target(resolve_target, member.filename_at_export, member.sha256, existing_by_name, existing_by_content)
             if target.existing_meme is not None:
                 target_id = str(getattr(target.existing_meme, "id", target.existing_meme))
                 with environment(request) as database_environment:
@@ -265,8 +313,16 @@ async def import_collection(
                 created_count += 1
                 with environment(request) as database_environment:
                     database_environment.collections.add_members(collection_id, [target_id])
-                existing_by_name[target.filename] = {"meme": target_id, "sha256": member.sha256}
-                result.update({"ok": True, "status": "imported", "target_meme_id": target_id, "saved_filename": target_path.name})
+                imported_filename = target.filename
+                try:
+                    imported_filename = scoped_metadata.saved_filename(target_id)
+                except (AttributeError, DatabaseError, MetadataError, TypeError, ValueError):
+                    pass
+                imported_extension = str(getattr(member, "extension", Path(imported_filename).suffix)).lower()
+                entry = {"meme": target_id, "sha256": member.sha256.lower(), "extension": imported_extension, "display_name": Path(imported_filename).stem}
+                existing_by_name[imported_filename] = entry
+                existing_by_content[(member.sha256.lower(), imported_extension)] = entry
+                result.update({"ok": True, "status": "imported", "target_meme_id": target_id, "saved_filename": imported_filename})
                 if thumbnail_enqueue is not None:
                     try:
                         thumbnail_enqueue(request, target_id)

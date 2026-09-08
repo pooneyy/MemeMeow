@@ -90,6 +90,48 @@ def test_export_writes_manifest_and_cleans_temporary_archive(tmp_path: Path) -> 
     cleanup_archive(export_dir)
 
 
+def test_export_projects_display_name_instead_of_content_key(tmp_path: Path) -> None:
+    """内容寻址物理文件导出时 manifest 只保留用户可见文件名。"""
+    store = BlobStore(root=tmp_path / "images", scope=ScopeContext("local"), local=True)
+    content = png_bytes()
+    digest = sha256_bytes(content)
+    physical_key = f"{digest}.png"
+    (store.root / physical_key).write_bytes(content)
+    meme = SimpleNamespace(
+        id=uuid4(),
+        storage_key=physical_key,
+        display_name="疑惑",
+        extension=".png",
+        size_bytes=len(content),
+        sha256=digest,
+    )
+    export_dir = tmp_path / ".collection-export-display-name"
+
+    archive_path = build_export_archive("我的合集", [meme], store, temp_root=export_dir)
+    package = preflight_archive(archive_path.read_bytes())
+
+    assert package.members[0].manifest.filename_at_export == "疑惑.png"
+    assert digest not in package.members[0].manifest.filename_at_export
+    cleanup_archive(archive_path)
+    cleanup_archive(export_dir)
+
+
+def test_export_rejects_content_key_when_display_name_is_missing(tmp_path: Path) -> None:
+    """内容寻址物理文件缺少展示字段时拒绝导出而不泄露 hash 文件名。"""
+    store = BlobStore(root=tmp_path / "images", scope=ScopeContext("local"), local=True)
+    content = png_bytes()
+    digest = sha256_bytes(content)
+    physical_key = f"{digest}.png"
+    (store.root / physical_key).write_bytes(content)
+    meme = SimpleNamespace(id=uuid4(), storage_key=physical_key, extension=".png", size_bytes=len(content), sha256=digest)
+
+    with pytest.raises(CollectionPackageError) as caught:
+        build_export_archive("缺少展示名", [meme], store, temp_root=tmp_path / ".collection-export-invalid")
+
+    assert caught.value.code == "member_changed"
+    assert digest not in str(caught.value)
+
+
 def test_preflight_rejects_path_attacks_duplicate_entries_and_bad_content() -> None:
     """预检拒绝路径穿越、重复条目、哈希错误和不可解码图片。"""
     content = png_bytes()
@@ -222,6 +264,19 @@ def test_filename_conflicts_use_sha_prefix_and_reuse_same_content() -> None:
     first_conflict = f"猫-{digest[:8]}.png"
     resolved = resolve_import_filename("猫.png", digest, {"猫.png": old, first_conflict: SimpleNamespace(id=uuid4(), sha256="c" * 64)})
     assert resolved.filename == f"猫-{digest[:16]}.png"
+
+
+def test_import_reuses_content_identity_and_returns_existing_display_name() -> None:
+    """导入遇到相同 SHA 和扩展名时复用 Meme，并返回其独立展示文件名。"""
+    digest = "a" * 64
+    existing = SimpleNamespace(id=uuid4(), storage_key=f"{digest}.png", display_name="旧名称", extension=".png", sha256=digest)
+    entry = {"meme": existing, "sha256": digest, "display_name": "旧名称", "extension": ".png"}
+
+    resolved = resolve_import_filename("新名称.png", digest, {"旧名称.png": entry}, {(digest, ".png"): entry})
+
+    assert resolved.existing_meme is existing
+    assert resolved.filename == "旧名称.png"
+    assert digest not in resolved.filename
 
 
 def test_cleanup_archive_unlinks_symlink_without_touching_target(tmp_path: Path) -> None:

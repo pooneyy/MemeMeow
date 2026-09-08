@@ -49,6 +49,24 @@ def test_duplicate_sha_prefers_valid_sidecar_without_deleting_files(tmp_path: Pa
     assert first.exists() and second.exists() and (tmp_path / "a.jpg.json").exists()
 
 
+def test_same_bytes_with_different_extensions_remain_separate_candidates(tmp_path: Path) -> None:
+    """扩展名属于物理身份，同字节的不同扩展名不能被迁移去重。"""
+    first = tmp_path / "first.jpg"
+    second = tmp_path / "second.png"
+    _write_image(first)
+    second.write_bytes(first.read_bytes())
+
+    first_item, first_error = inspect_image(first, tmp_path, max_size=1024 * 1024)
+    second_item, second_error = inspect_image(second, tmp_path, max_size=1024 * 1024)
+    assert first_item is not None and first_error is None
+    assert second_item is not None and second_error is None
+
+    selected, skipped = _candidate_groups([first_item, second_item])
+
+    assert {item.storage_key for item in selected} == {"first.jpg", "second.png"}
+    assert skipped == []
+
+
 def test_sidecar_identity_mismatch_is_not_imported_as_context(tmp_path: Path) -> None:
     """sidecar 路径或指纹不匹配时仍可登记图片，但只能进入待修复状态。"""
     image = tmp_path / "mismatch.jpg"

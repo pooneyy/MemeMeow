@@ -14,6 +14,7 @@ from fastapi import HTTPException, Query, Request
 
 from backend.agent_resume import within_total_timeout
 from backend.database import DatabaseError
+from backend.image_naming import public_filename_fields
 from backend.metadata import MetadataError
 from backend.opencode_activity import AgentActivity
 from backend.public_dto import (
@@ -180,11 +181,13 @@ def task_summary(
     meme_id = normalize_public_identifier(payload.get("meme_id"))
     if meme_id:
         try:
-            _meme_record, image = service(request, "metadata").image_for_meme(meme_id)
+            meme_record, _image = service(request, "metadata").image_for_meme(meme_id)
             image_data: dict[str, object] = {"meme_id": meme_id, "media_url": f"/media/{meme_id}"}
-            filename = normalize_public_filename(getattr(image, "name", None))
-            if filename:
-                image_data["filename"] = filename
+            try:
+                image_data.update(public_filename_fields(meme_record))
+            except ValueError:
+                # 展示字段损坏时保留 Meme 关联，但绝不把内容寻址 key 投影给客户端。
+                pass
             data["image"] = image_data
         except MetadataError:
             data["image"] = {"meme_id": meme_id}

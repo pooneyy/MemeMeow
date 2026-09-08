@@ -28,7 +28,9 @@ class _Environment:
 
     def __init__(self, records: list[object], visual: object | None = None) -> None:
         self.memes = SimpleNamespace(list=lambda **_kwargs: records, count=lambda **_kwargs: len(records))
-        self.visual = SimpleNamespace(get=lambda *_args, **_kwargs: visual)
+        self.visual = SimpleNamespace(
+            ready_ids=lambda values, **_kwargs: {item.id for item in values} if visual is not None else set(),
+        )
 
     def __enter__(self) -> "_Environment":
         """返回当前测试环境。"""
@@ -59,7 +61,7 @@ class _Metadata:
         """返回测试 Meme 与受控文件路径。"""
         if meme_id == "missing":
             raise MetadataError("metadata_missing")
-        return SimpleNamespace(id=meme_id), self.image
+        return SimpleNamespace(id=meme_id, display_name="meme", extension=".png"), self.image
 
     def load(self, _image):
         """返回可投影的 metadata 对象。"""
@@ -93,7 +95,7 @@ def _call_list(request, records, environment, services, processing=None):
             page_size=50,
             services=lambda _request: services,
             environment=lambda _request: environment,
-            processing_repository=lambda _request: processing or SimpleNamespace(latest_for_target=lambda *_args: None),
+            processing_repository=lambda _request: processing or SimpleNamespace(latest_for_targets=lambda _targets: {}),
             visual_identity=lambda _request: SimpleNamespace(model="visual", preprocess_version="v1", dimensions=768),
             error=_error,
         )
@@ -129,11 +131,12 @@ def test_image_list_projects_status_and_processing_summary(tmp_path: Path) -> No
     """列表输出稳定图片字段、三类状态和最新处理摘要。"""
     image = tmp_path / "meme.png"
     image.write_bytes(b"image-content")
-    record = SimpleNamespace(id=uuid4(), storage_key="meme.png", extension=".png", sha256="a" * 64)
-    processing = SimpleNamespace(latest_for_target=lambda *_args: SimpleNamespace(as_dict=lambda: {"job_id": "job-1", "status": "failed", "auto_name": True, "has_warnings": True, "stages": []}))
+    record = SimpleNamespace(id=uuid4(), storage_key="a" * 64 + ".png", display_name="meme", extension=".png", size_bytes=13, sha256="a" * 64, context_status="ready")
+    processing = SimpleNamespace(latest_for_targets=lambda _targets: {record.id: SimpleNamespace(as_dict=lambda: {"job_id": "job-1", "status": "failed", "auto_name": True, "has_warnings": True, "stages": []})})
     payload = _call_list(_request(), [record], _Environment([record], visual=object()), _services(image), processing)
     item = payload["items"][0]
     assert item["meme_id"] == str(record.id)
+    assert item["filename"] == "meme.png"
     assert item["media_url"] == f"/media/{record.id}"
     assert item["embedding_status"] == "ready"
     assert item["visual_embedding_status"] == "ready"
@@ -145,8 +148,8 @@ def test_image_list_projects_text_embedding_status_per_image(tmp_path: Path) -> 
     """同一 scope 中只有实际拥有有效向量的图片才显示文本索引已就绪。"""
     image = tmp_path / "meme.png"
     image.write_bytes(b"image-content")
-    ready = SimpleNamespace(id=uuid4(), storage_key="ready.png", extension=".png", sha256="a" * 64)
-    pending = SimpleNamespace(id=uuid4(), storage_key="pending.png", extension=".png", sha256="b" * 64)
+    ready = SimpleNamespace(id=uuid4(), storage_key="a" * 64 + ".png", display_name="ready", extension=".png", size_bytes=13, sha256="a" * 64, context_status="ready")
+    pending = SimpleNamespace(id=uuid4(), storage_key="b" * 64 + ".png", display_name="pending", extension=".png", size_bytes=13, sha256="b" * 64, context_status="ready")
     services = SimpleNamespace(
         metadata=_Metadata(image),
         search=SimpleNamespace(
@@ -160,19 +163,22 @@ def test_image_list_projects_text_embedding_status_per_image(tmp_path: Path) -> 
     assert [item["embedding_status"] for item in payload["items"]] == ["ready", "pending"]
 
 
-def test_image_list_reuses_source_identity_for_thumbnail_projection_and_metadata(tmp_path: Path) -> None:
-    """图片列表对同一原图只计算一次 SHA，并把身份传给缩略图和 metadata。"""
+def test_image_list_uses_database_source_identity_without_reading_original(tmp_path: Path) -> None:
+    """图片列表只把数据库源版本事实传给缩略图，不读取原图或调用 metadata identity。"""
     image = tmp_path / "meme.png"
     image.write_bytes(b"image-content")
     record = SimpleNamespace(
         id=uuid4(),
-        storage_key="meme.png",
+        storage_key="a" * 64 + ".png",
+        display_name="meme",
         extension=".png",
+        size_bytes=13,
         sha256=hashlib.sha256(b"image-content").hexdigest(),
+        context_status="ready",
     )
 
     class CountingMetadata(_Metadata):
-        """记录列表请求中的原图身份计算与复用。"""
+        """拒绝列表路径重新解析或读取原图。"""
 
         def __init__(self, source):
             """初始化身份读取计数。"""
@@ -181,46 +187,44 @@ def test_image_list_reuses_source_identity_for_thumbnail_projection_and_metadata
             self.received_identity = None
 
         def _identity(self, _image):
-            """返回完整文件身份并记录调用次数。"""
+            """列表不应调用原图身份计算。"""
             self.identity_calls += 1
-            return {"size_bytes": 13, "sha256": record.sha256, "extension": ".png", "relative_path": "meme.png"}
+            raise AssertionError("列表不应计算原图 SHA")
 
         def status(self, _image, *, identity=None):
-            """接收列表已验证的身份，避免再次读取文件。"""
-            self.received_identity = identity
-            return {"status": "ready", "title": "标题"}
+            """列表不应读取 sidecar 状态。"""
+            raise AssertionError("列表不应读取 metadata")
 
     metadata = CountingMetadata(image)
     projections: list[dict[object, tuple[int, str]]] = []
     services = SimpleNamespace(
         metadata=metadata,
-        search=SimpleNamespace(has_cache=lambda: True),
+        search=SimpleNamespace(valid_text_embedding_ids=lambda _records: set()),
         thumbnails=SimpleNamespace(
             projections=lambda _records, *, source_identities: projections.append(source_identities) or {record.id: {"status": "pending", "media_url": None}}
         ),
     )
     payload = _call_list(_request(), [record], _Environment([record], visual=None), services)
     assert payload["items"][0]["thumbnail"]["status"] == "pending"
-    assert metadata.identity_calls == 1
-    assert metadata.received_identity is not None
+    assert metadata.identity_calls == 0
     assert projections == [{record.id: (13, record.sha256)}]
 
 
-def test_image_list_supports_legacy_thumbnail_projection_signature(tmp_path: Path) -> None:
-    """图片列表仍可调用只接受 records positional 参数的旧缩略图 facade。"""
+def test_image_list_passes_database_identity_to_batch_thumbnail_projection(tmp_path: Path) -> None:
+    """图片列表向批量缩略图投影传递数据库中的源版本事实。"""
     image = tmp_path / "meme.png"
     image.write_bytes(b"image-content")
-    record = SimpleNamespace(id=uuid4(), storage_key="meme.png", extension=".png", sha256="a" * 64)
-    calls: list[list[object]] = []
+    record = SimpleNamespace(id=uuid4(), storage_key="a" * 64 + ".png", display_name="meme", extension=".png", size_bytes=13, sha256="a" * 64, context_status="ready")
+    calls: list[dict[object, tuple[int, str]]] = []
     services = _services(image)
     services.thumbnails = SimpleNamespace(
-        projections=lambda records: calls.append(records) or {record.id: {"status": "pending", "media_url": None}}
+        projections=lambda _records, *, source_identities: calls.append(source_identities) or {record.id: {"status": "pending", "media_url": None}}
     )
 
     payload = _call_list(_request(), [record], _Environment([record], visual=None), services)
 
     assert payload["items"][0]["thumbnail"]["status"] == "pending"
-    assert calls == [[record]]
+    assert calls == [{record.id: (13, record.sha256)}]
 
 
 @pytest.mark.parametrize("selector", ["directory", "scope_id", "user_id"])
@@ -262,12 +266,42 @@ def test_image_metadata_and_media_use_meme_id_and_verified_path(tmp_path: Path) 
     assert response.media_type == "image/png"
 
 
+def test_image_metadata_rejects_missing_display_fields_without_exposing_content_key(tmp_path: Path) -> None:
+    """图片详情缺失展示字段时失败关闭，响应中不得出现内容寻址 key。"""
+    digest = "a" * 64
+    image = tmp_path / f"{digest}.png"
+    image.write_bytes(b"image-content")
+    services = _services(image)
+    services.metadata.image_for_meme = lambda _meme_id: (
+        SimpleNamespace(id="meme-1", storage_key=f"{digest}.png", sha256=digest, extension=".png"),
+        image,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(image_library_http.image_metadata(_request(), meme_id="meme-1", services=lambda _request: services, error=_error))
+
+    assert (caught.value.status_code, caught.value.detail["error"]) == (409, "metadata_invalid")
+    assert digest not in str(caught.value.detail)
+
+
 def test_image_media_maps_metadata_failure_to_not_found(tmp_path: Path) -> None:
-    """媒体路径指纹/记录错误只投影稳定 not-found。"""
+    """媒体路径指纹冲突投影为明确的身份冲突，而不是伪装成不存在。"""
     image = tmp_path / "meme.png"
     image.write_bytes(b"image-content")
     services = _services(image)
     services.metadata.image_for_meme = lambda _meme_id: (_ for _ in ()).throw(MetadataError("metadata_image_mismatch"))
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(image_library_http.media(_request(), meme_id="meme-1", services=lambda _request: services, error=_error))
+    assert caught.value.status_code == 409
+    assert caught.value.detail["error"] == "metadata_image_mismatch"
+
+
+def test_image_media_maps_missing_metadata_to_not_found(tmp_path: Path) -> None:
+    """媒体对应记录或文件缺失时仍保持稳定 404。"""
+    image = tmp_path / "meme.png"
+    image.write_bytes(b"image-content")
+    services = _services(image)
+    services.metadata.image_for_meme = lambda _meme_id: (_ for _ in ()).throw(MetadataError("file_not_found"))
     with pytest.raises(HTTPException) as caught:
         asyncio.run(image_library_http.media(_request(), meme_id="meme-1", services=lambda _request: services, error=_error))
     assert caught.value.status_code == 404

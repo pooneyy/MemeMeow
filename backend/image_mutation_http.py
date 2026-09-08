@@ -13,8 +13,10 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 
+from backend.image_naming import saved_filename
 from backend.metadata import MetadataError
 from backend.operation_policy import OperationPolicyError, Operations
+from backend.persistence.engine import DatabaseError
 
 
 MetadataServiceProvider = Callable[[Request], Any]
@@ -26,6 +28,28 @@ OperationAcquire = Callable[..., Any]
 OperationCommit = Callable[[Request, Any], None]
 OperationRelease = Callable[[Request, Any], None]
 OperationErrorProjector = Callable[[OperationPolicyError], HTTPException]
+
+
+def _public_saved_filename(metadata_service: Any, meme_id: str, fallback: str) -> str:
+    """投影重命名后的公开文件名，避免把物理 storage_key 返回给客户端。
+
+    生产 metadata service 通过当前 scope 的 Meme 记录返回规范展示名；旧测试 facade
+    没有该方法时，使用本次请求已经通过校验的展示名作为兼容回退。调用场景是人工和
+    自动重命名成功后的 HTTP 响应。
+    """
+    resolver = getattr(metadata_service, "saved_filename", None)
+    if callable(resolver):
+        try:
+            value = resolver(meme_id)
+        except (AttributeError, DatabaseError, MetadataError, TypeError, ValueError):
+            value = None
+        if isinstance(value, str) and value:
+            return value
+    try:
+        return saved_filename(Path(fallback).stem, Path(fallback).suffix)
+    except ValueError:
+        # fallback 已经经过入口校验；这里只保留一个不暴露物理身份的稳定结果。
+        return Path(fallback).name
 
 
 async def rename_image(
@@ -62,9 +86,9 @@ async def rename_image(
     except ValueError as exc:
         raise error(400, "invalid_filename", "文件名非法") from exc
 
-    target = scoped_metadata.blob_store.resolve(clean, must_exist=False)
-    if target.exists() and target != source:
-        raise error(409, "file_exists", "目标文件已存在")
+    # 物理文件名是内容寻址 key；重命名只改变展示名，因此不能把同名孤立文件
+    # 当成冲突，也不能为展示名移动或覆盖任何物理对象。
+    target = source.with_name(clean)
     try:
         metadata = scoped_metadata.rename_by_id(payload.meme_id, target)
     except MetadataError as exc:
@@ -74,7 +98,7 @@ async def rename_image(
     invalidate_search(request)
     return {
         "meme_id": payload.meme_id,
-        "filename": Path(metadata.image.relative_path).name,
+        "filename": _public_saved_filename(scoped_metadata, payload.meme_id, clean),
         "media_url": f"/media/{payload.meme_id}",
     }
 

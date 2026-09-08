@@ -173,3 +173,13 @@ def test_upload_policy_rejection_is_fail_closed(tmp_path: Path, monkeypatch: pyt
     assert caught.value.status_code == 403
     assert "upload_bytes" not in events
     assert "commit" not in events
+
+
+def test_public_upload_filename_omits_hash_fallback_without_display_record() -> None:
+    """旧 facade 只返回 meme_id 时，上传结果不能把内容寻址 key 当文件名返回。"""
+    digest = "a" * 64
+    record = SimpleNamespace(sha256=digest, extension=".png")
+
+    assert image_upload_http._public_saved_filename(SimpleNamespace(), record, f"{digest}.png") is None
+    assert image_upload_http._public_saved_filename(SimpleNamespace(), "meme-1", f"{digest}.png") is None
+    assert image_upload_http._public_saved_filename(SimpleNamespace(), "meme-1", "原名.png") == "原名.png"

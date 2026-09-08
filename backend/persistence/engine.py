@@ -25,7 +25,7 @@ from backend.persistence.models import (
 
 SCOPE_LOCAL = "local"
 # 当前代码要求的 Alembic head；数据库初始化脚本会显式传入同一 revision。
-CURRENT_SCHEMA_REVISION = "0020_visual_match_snapshot"
+CURRENT_SCHEMA_REVISION = "0023_image_processing_fixed_plans"
 
 
 class DatabaseError(RuntimeError):
@@ -115,6 +115,32 @@ def ensure_optional_control_schema(engine: Engine) -> None:
             connection.execute(text("UPDATE image_processing_jobs SET auto_name = FALSE WHERE auto_name IS NULL"))
             connection.execute(text("ALTER TABLE image_processing_jobs ALTER COLUMN auto_name SET DEFAULT FALSE"))
             connection.execute(text("ALTER TABLE image_processing_jobs ALTER COLUMN auto_name SET NOT NULL"))
+            connection.execute(text("ALTER TABLE image_processing_jobs ADD COLUMN IF NOT EXISTS processing_mode VARCHAR(16)"))
+            connection.execute(text("UPDATE image_processing_jobs SET processing_mode = 'normal' WHERE processing_mode IS NULL"))
+            connection.execute(text("ALTER TABLE image_processing_jobs ALTER COLUMN processing_mode SET DEFAULT 'normal', ALTER COLUMN processing_mode SET NOT NULL"))
+            connection.execute(text("ALTER TABLE image_processing_stages ADD COLUMN IF NOT EXISTS planned BOOLEAN NOT NULL DEFAULT TRUE"))
+            connection.execute(text("ALTER TABLE image_processing_stages ADD COLUMN IF NOT EXISTS skip_reason VARCHAR(32)"))
+            connection.execute(text("UPDATE image_processing_stages SET planned = FALSE, skip_reason = COALESCE(skip_reason, 'disabled') WHERE status = 'skipped'"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS target_meme_id UUID"))
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS target_image_sha256 VARCHAR(64)"))
+            connection.execute(text("""
+                UPDATE tasks AS task
+                   SET target_meme_id = COALESCE(task.target_meme_id, job.meme_id),
+                       target_image_sha256 = COALESCE(task.target_image_sha256, job.image_sha256)
+                  FROM image_processing_jobs AS job
+                 WHERE task.scope_id = job.scope_id
+                   AND task.processing_job_id = job.id
+                   AND (task.target_meme_id IS NULL OR task.target_image_sha256 IS NULL)
+            """))
+            unresolved = connection.execute(text("""
+                SELECT count(*)
+                  FROM tasks
+                 WHERE task_type IN ('visual_embedding_generation','meme_context_generation','image_auto_rename','text_embedding_generation')
+                   AND status IN ('queued','running')
+                   AND (target_meme_id IS NULL OR target_image_sha256 IS NULL)
+            """)).scalar_one()
+            if int(unresolved or 0) > 0:
+                raise DatabaseError("image_processing_history_unresolved")
             connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS expected_revision BIGINT"))
             connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS claim_generation BIGINT"))
             connection.execute(text("ALTER TABLE storage_operations ADD COLUMN IF NOT EXISTS attempt INTEGER"))
@@ -150,6 +176,22 @@ def ensure_optional_control_schema(engine: Engine) -> None:
                 ALTER TABLE image_processing_jobs DROP CONSTRAINT IF EXISTS ck_image_processing_policy;
                 ALTER TABLE image_processing_jobs ADD CONSTRAINT ck_image_processing_policy
                     CHECK (reverse_image_policy IN ('forbid','auto'));
+                ALTER TABLE image_processing_jobs DROP CONSTRAINT IF EXISTS ck_image_processing_mode;
+                ALTER TABLE image_processing_jobs ADD CONSTRAINT ck_image_processing_mode
+                    CHECK (processing_mode IN ('normal','full_retry','repair'));
+                ALTER TABLE image_processing_stages DROP CONSTRAINT IF EXISTS ck_image_processing_stage_plan;
+                ALTER TABLE image_processing_stages DROP CONSTRAINT IF EXISTS ck_image_processing_stage_plan_status;
+                ALTER TABLE image_processing_stages ADD CONSTRAINT ck_image_processing_stage_plan
+                    CHECK ((planned AND skip_reason IS NULL) OR (NOT planned AND skip_reason IN ('already_ready','disabled')));
+                ALTER TABLE image_processing_stages ADD CONSTRAINT ck_image_processing_stage_plan_status
+                    CHECK ((planned AND status <> 'skipped') OR (NOT planned AND status = 'skipped'));
+                ALTER TABLE tasks DROP CONSTRAINT IF EXISTS fk_tasks_target_meme;
+                ALTER TABLE tasks ADD CONSTRAINT fk_tasks_target_meme
+                    FOREIGN KEY (scope_id, target_meme_id)
+                    REFERENCES memes(scope_id, id) ON DELETE CASCADE;
+                ALTER TABLE tasks DROP CONSTRAINT IF EXISTS ck_task_target_image_sha256;
+                ALTER TABLE tasks ADD CONSTRAINT ck_task_target_image_sha256
+                    CHECK (target_image_sha256 IS NULL OR length(target_image_sha256) = 64);
                 ALTER TABLE storage_operations DROP CONSTRAINT IF EXISTS ck_storage_operation_expected_revision;
                 ALTER TABLE storage_operations DROP CONSTRAINT IF EXISTS ck_storage_operation_claim_generation;
                 ALTER TABLE storage_operations DROP CONSTRAINT IF EXISTS ck_storage_operation_attempt;
@@ -164,6 +206,7 @@ def ensure_optional_control_schema(engine: Engine) -> None:
                     CHECK (expected_title_fingerprint IS NULL OR length(expected_title_fingerprint) = 64);
             """))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_image_submission ON tasks(scope_id, submission_mode, image_stage, processing_job_id, created_at)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_image_target_active ON tasks(scope_id, target_meme_id, target_image_sha256, status, created_at)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_storage_operations_task ON storage_operations(scope_id, task_id, updated_at)"))
             connection.execute(text("ALTER TABLE image_processing_jobs ADD COLUMN IF NOT EXISTS processing_config JSONB NOT NULL DEFAULT '{}'::jsonb"))
             connection.execute(text("ALTER TABLE reverse_image_usage_events ADD COLUMN IF NOT EXISTS claim_generation BIGINT"))

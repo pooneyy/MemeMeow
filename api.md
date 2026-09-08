@@ -81,19 +81,19 @@ app = create_app(scope_resolver=LocalScopeResolver("local"))
 - `POST /images/context/batch`：请求 `{ "items": [{"meme_id":"..."}], "include_unready": true, "reverse_image_policy": "forbid|auto", "auto_name": false }`，逐图返回处理 job 结果；省略 `items` 时不隐式扫描孤立文件。
 - 视觉向量生成使用 `POST /images/stages`，请求为 `{ "meme_id": "...", "stage": "visual" }`；它只创建视觉阶段 Task，不创建 Agent、自动命名或文本向量 Task。视觉阶段不得携带 `reverse_image_policy`，携带该字段直接返回参数错误。
 - `POST /images/metadata/repair`：异步执行数据库记录、图片文件和指纹完整性扫描；不读取 sidecar、不默认调用模型或外部搜索。
-- 图片库的“选择图片”“重试选中”和“完整重试所有未就绪”会调用上述逐图处理接口；有效文本向量写回后会立即具备当前 scope 的搜索资格，不需要为每次上传重建全库缓存。模型切换和存量迁移的显式回填见 [`docs/image-processing-migration.md`](docs/image-processing-migration.md)。
+- 图片库的“选择图片”“完整重试”和“修复所有未就绪”会调用上述逐图处理接口；有效文本向量写回后会立即具备当前 scope 的搜索资格，不需要为每次上传重建全库缓存。模型切换和存量迁移的显式回填见 [`docs/image-processing-migration.md`](docs/image-processing-migration.md)。
 
 ### 图片处理 job
 
-`POST /images/processing?page=1&page_size=100` 按当前 scope 分页枚举图片并提交或复用逐图处理 job，请求体为 `{ "reverse_image_policy": "forbid|auto", "auto_name": false }`。单图处理按 `visual -> agent -> auto_rename -> text_embedding` 推进；`auto_name=false` 时自动重命名阶段为 `skipped` 且不创建叶子 Task，每个实际阶段拥有独立叶子 Task，视觉和文本阶段不消耗 Agent operation grant。活动 job 的配置、目标 SHA、metadata hash 或策略不一致时返回 `409 generation_policy_conflict`，仅自动命名选项不一致时返回 `409 processing_options_conflict`。
+`POST /images/processing?page=1&page_size=100` 按当前 scope 分页枚举图片并提交逐图处理 Job，请求体为 `{ "reverse_image_policy": "forbid|auto", "auto_name": false }`。单图处理按 `visual -> agent -> auto_rename -> text_embedding` 推进；父 Job 创建时会保存 `processing_mode` 和每个阶段的 `planned/skip_reason`。`auto_name=false` 时自动重命名阶段为 `skipped/disabled` 且不创建叶子 Task，每个计划阶段拥有独立叶子 Task，视觉和文本阶段不消耗 Agent operation grant。同一图片已有活动 Job 或阶段 Task 时返回 `409 image_processing_active`，不会复用活动执行。
 
-`POST /images/processing/unready` 只接受上述两项选项，由服务端枚举当前 scope 全部核心未就绪图片，不接受前端图片列表、筛选或分页参数；响应返回目标、提交、复用、冲突和失败摘要。
+`POST /images/processing/unready` 只接受上述两项选项，由服务端枚举当前 scope 全部未就绪图片，不接受前端图片列表、筛选或分页参数；产品名称为“修复所有未就绪”，服务端按图片固定最小修复范围。响应逐图返回 `submitted`、`processing_active`、`not_needed` 或 `failed`，汇总包含 `target_count`、`submitted_count`、固定为零的 `reused_count`、`conflict_count`、`not_needed_count` 和 `failed_count`。
 
 `GET /images/processing/{job_id}` 返回有限状态：`queued`、`running`、`succeeded`、`failed`、`blocked` 或 `unknown_execution`，以及 `current_stage`、每阶段 `task_id`/attempt/error、`auto_name`、`has_warnings` 和有限 warning 摘要。跨 scope 或不存在的 ID 都返回 `404 image_processing_job_not_found`。
 
-`GET /images/processing` 返回当前 scope 的完整 Job 父项及 visual、agent、auto_rename、text_embedding 四个阶段；Job 和叶子 Task 的 `submission_mode` 明确为 `pipeline`。历史三阶段 Job 读取时合成 `auto_name=false` 和 `auto_rename=skipped`，不回写历史。
+`GET /images/processing` 返回当前 scope 的完整 Job 父项及 visual、agent、auto_rename、text_embedding 四个阶段；Job 和叶子 Task 的 `submission_mode` 明确为 `pipeline`。阶段项包含 `planned` 和 `skip_reason`，用于区分本次执行和本次未执行。历史三阶段 Job 读取时只读合成 `auto_name=false`、`auto_rename=skipped/disabled`，不回写历史。
 
-`POST /images/stages` 请求接受 `{ "meme_id": "...", "stage": "visual|agent|auto_rename|text_embedding", "reverse_image_policy": "forbid|auto" }`，创建或复用无父 Job 的独立阶段 Task。视觉阶段不得提供 `reverse_image_policy`；Agent 阶段的策略由服务端校验。scope、图片 SHA、配置、grant、标题指纹和目标文件名均由服务端派生；返回 `submission_mode=standalone` 与 `processing_job_id=null`。`image_auto_rename` 不得通过通用 `/tasks/{task_id}/retry` 重试。
+`POST /images/stages` 请求接受 `{ "meme_id": "...", "stage": "visual|agent|auto_rename|text_embedding", "reverse_image_policy": "forbid|auto" }`，创建一个无父 Job 的独立阶段 Task。视觉阶段不得提供 `reverse_image_policy`；Agent 阶段的策略由服务端校验。scope、图片 SHA、配置、grant、标题指纹和目标文件名均由服务端派生；返回 `submission_mode=standalone` 与 `processing_job_id=null`。同一图片已有活动 Job 或阶段 Task 时返回 `409 image_processing_active`，不会复用活动 Task。`image_auto_rename` 不得通过通用 `/tasks/{task_id}/retry` 重试。
 
 `POST /images/stages/batch` 请求 `{ "items": [{"meme_id":"..."}], "stages": ["visual", "agent", "text_embedding"], "reverse_image_policy": "forbid|auto", "auto_name": false }`，为每个选中图片和所选阶段创建或复用独立 Task；阶段列表至少一项、最多三项且不得重复，只接受三个核心阶段。完整重试仍使用 `/images/context/batch` 的完整流水线契约。
 

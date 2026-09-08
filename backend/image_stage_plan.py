@@ -24,6 +24,8 @@ IMAGE_PROCESSING_TASK_TYPES = frozenset(STAGE_TASK_TYPES.values())
 IMAGE_PROCESSING_MAX_ATTEMPTS = 1
 SETTLED_STAGE_STATUSES = frozenset({"succeeded", "skipped", "warning"})
 BLOCKING_STAGE_STATUSES = frozenset({"failed", "blocked", "unknown_execution", "target_changed"})
+PROCESSING_MODES = frozenset({"normal", "full_retry", "repair"})
+STAGE_SKIP_REASONS = frozenset({"already_ready", "disabled"})
 
 
 class ImageStagePlanError(ValueError):
@@ -33,6 +35,54 @@ class ImageStagePlanError(ValueError):
         """创建带稳定错误码的阶段计划错误。"""
         self.code = code
         super().__init__(code)
+
+
+def normalize_processing_mode(value: object) -> str:
+    """规范化父 Job 的处理方式，拒绝把旧布尔值带入核心编排。"""
+    if not isinstance(value, str) or value not in PROCESSING_MODES:
+        raise ImageStagePlanError("invalid_processing_mode")
+    return value
+
+
+def build_stage_plan(
+    processing_mode: object,
+    *,
+    auto_name: bool,
+    readiness: Mapping[str, bool] | None = None,
+) -> dict[str, tuple[bool, str | None]]:
+    """根据创建时的结果快照生成固定阶段计划。
+
+    ``readiness`` 只接受创建 Job 前已经取得的结果事实；函数不读取数据库或文件。
+    返回值按固定阶段名给出 ``(planned, skip_reason)``，供 repository 在同一事务
+    中持久化。修复模式遵循阶段依赖：Agent 变化会带动自动命名和文本向量，视觉
+    变化本身不会强制重跑下游。
+    """
+    mode = normalize_processing_mode(processing_mode)
+    if type(auto_name) is not bool:
+        raise ImageStagePlanError("invalid_auto_name")
+    current = {stage: bool((readiness or {}).get(stage, False)) for stage in IMAGE_STAGE_ORDER}
+    planned: set[str]
+    if mode == "full_retry":
+        planned = {stage for stage in IMAGE_STAGE_ORDER if stage != "auto_rename" or auto_name}
+    else:
+        planned = set()
+        if not current["visual"]:
+            planned.add("visual")
+        if not current["agent"]:
+            planned.update({"agent", "text_embedding"})
+            if auto_name:
+                planned.add("auto_rename")
+        if not current["auto_rename"] and auto_name:
+            planned.add("auto_rename")
+        if not current["text_embedding"]:
+            planned.add("text_embedding")
+    return {
+        stage: (
+            stage in planned,
+            None if stage in planned else ("disabled" if stage == "auto_rename" and not auto_name else "already_ready"),
+        )
+        for stage in IMAGE_STAGE_ORDER
+    }
 
 
 def normalize_stage(value: object) -> str:
@@ -94,14 +144,16 @@ class ImageStagePlan:
         """判断阶段是否需要执行；关闭自动命名时该阶段直接跳过。"""
         return normalize_stage(stage) != "auto_rename" or self.auto_name
 
-    def next_stage(self, statuses: Mapping[str, str]) -> str | None:
+    def next_stage(self, statuses: Mapping[str, str], planned: Mapping[str, bool] | None = None) -> str | None:
         """根据已观察阶段状态返回唯一下一阶段。
 
         前置阶段失败、阻止或未知时返回 ``None``，由调用方保留 Job 终态；不会
         越过失败阶段安排后续任务。
         """
         for stage in self.stages:
-            if not self.is_enabled(stage):
+            if planned is not None and not bool(planned.get(stage, False)):
+                continue
+            if planned is None and not self.is_enabled(stage):
                 continue
             status = statuses.get(stage, "queued")
             if status in BLOCKING_STAGE_STATUSES:
@@ -110,18 +162,30 @@ class ImageStagePlan:
                 return stage
         return None
 
-    def can_run(self, stage: object, statuses: Mapping[str, str]) -> bool:
+    def can_run(self, stage: object, statuses: Mapping[str, str], planned: Mapping[str, bool] | None = None) -> bool:
         """判断某阶段是否是当前唯一可运行阶段。"""
         normalized = normalize_stage(stage)
-        return self.next_stage(statuses) == normalized
+        return self.next_stage(statuses, planned) == normalized
 
-    def settled(self, statuses: Mapping[str, str]) -> bool:
+    def settled(self, statuses: Mapping[str, str], planned: Mapping[str, bool] | None = None) -> bool:
         """判断所有启用阶段是否已经成功、跳过或 warning 收束。"""
-        return all(not self.is_enabled(stage) or statuses.get(stage) in SETTLED_STAGE_STATUSES for stage in self.stages)
+        return all(
+            (not bool(planned.get(stage, False)) if planned is not None else not self.is_enabled(stage))
+            or statuses.get(stage) in SETTLED_STAGE_STATUSES
+            for stage in self.stages
+        )
 
-    def blocked(self, statuses: Mapping[str, str]) -> bool:
+    def blocked(self, statuses: Mapping[str, str], planned: Mapping[str, bool] | None = None) -> bool:
         """判断是否存在阻止继续推进的阶段终态。"""
-        return any(statuses.get(stage) in BLOCKING_STAGE_STATUSES for stage in self.stages if self.is_enabled(stage))
+        eligible = (
+            (stage for stage in self.stages if bool(planned.get(stage, False)))
+            if planned is not None
+            else (stage for stage in self.stages if self.is_enabled(stage))
+        )
+        return any(
+            statuses.get(stage) in BLOCKING_STAGE_STATUSES
+            for stage in eligible
+        )
 
 
 def downstream_stages(stage: object) -> tuple[str, ...]:
@@ -137,14 +201,18 @@ __all__ = [
     "IMAGE_STAGE_ORDER",
     "IMAGE_PROCESSING_MAX_ATTEMPTS",
     "IMAGE_PROCESSING_TASK_TYPES",
+    "PROCESSING_MODES",
     "ImageStagePlan",
     "ImageStagePlanError",
     "SETTLED_STAGE_STATUSES",
+    "STAGE_SKIP_REASONS",
     "STAGE_TASK_TYPES",
     "TASK_TYPE_STAGES",
     "downstream_stages",
+    "build_stage_plan",
     "image_task_requires_single_attempt",
     "normalize_stage",
+    "normalize_processing_mode",
     "stage_for_task_type",
     "task_type_for_stage",
 ]

@@ -217,7 +217,7 @@ describe('TasksWorkspace', () => {
     expect(wrapper.text()).toContain('四阶段流水线')
     expect(wrapper.get('.processing-job-parent .task-image').text()).toBe('sample.png')
     expect(wrapper.get('.processing-job-parent').text()).not.toContain('Agent 语境')
-    expect(wrapper.text()).toContain('Agent 语境处理中')
+    expect(wrapper.text()).toContain('图片语境分析处理中')
     expect(wrapper.text()).toContain('自动重命名未启用')
     expect(wrapper.text()).toContain('未启用')
     expect(wrapper.text()).toContain('第 1 次尝试')

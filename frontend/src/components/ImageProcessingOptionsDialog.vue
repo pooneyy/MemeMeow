@@ -10,6 +10,7 @@ const props = defineProps<{
   busy: boolean
   returnFocus?: HTMLElement | null
   initialOptions?: ImageProcessingOptions
+  processingTarget?: 'full_retry' | 'repair'
 }>()
 
 const emit = defineEmits<{
@@ -68,6 +69,9 @@ function cancel(): void {
       <header class="image-dialog-head">
         <div>
           <h2 id="processing-options-title">图片处理选项</h2>
+          <p class="processing-options-description">
+            {{ props.processingTarget === 'repair' ? '只为存在问题的图片和阶段创建修复任务。' : '所有已启用阶段都会重新执行，即使已有结果仍然有效。' }}
+          </p>
         </div>
         <button class="quiet" type="button" :disabled="busy" aria-label="取消图片处理" @click="cancel">取消</button>
       </header>

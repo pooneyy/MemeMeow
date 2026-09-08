@@ -14,22 +14,37 @@ from fastapi import Request
 from backend.scope import ScopeServices
 
 
-STORAGE_PREFLIGHT_BLOCKING_KEYS = ("non_flat_keys", "nested_images", "missing_files", "mismatched")
+# 结构性问题会阻断 local 启动和检索重建；原图缺失/指纹漂移只在摘要中报告，
+# 由真正消费原图字节的媒体或处理路径 fail-closed。
+STORAGE_PREFLIGHT_BLOCKING_KEYS = (
+    "non_flat_keys",
+    "invalid_sha256",
+    "invalid_extensions",
+    "invalid_display_names",
+    "non_content_addressed_keys",
+    "duplicate_content",
+    "nested_images",
+    "active_operations",
+)
 
 
 def _storage_preflight_summary(report: Mapping[str, object] | None) -> dict[str, object]:
     """生成不包含文件名的存储预检摘要，供健康检查和配置接口诊断。"""
     report = report or {}
-    blocking = {
+    report_errors = {
         key: len(value) if isinstance(value, (list, tuple, set, dict)) else 0
-        for key in STORAGE_PREFLIGHT_BLOCKING_KEYS
+        for key in (
+            *STORAGE_PREFLIGHT_BLOCKING_KEYS,
+            "missing_files",
+            "mismatched",
+        )
         if (value := report.get(key))
     }
     orphan_files = report.get("orphan_files")
     return {
         "status": "warning" if orphan_files else "ok",
         "orphan_files": len(orphan_files) if isinstance(orphan_files, (list, tuple, set, dict)) else 0,
-        "blocking_errors": blocking,
+        "blocking_errors": report_errors,
     }
 
 

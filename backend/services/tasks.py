@@ -199,12 +199,13 @@ class PostgresTaskService:
                 revision=payload.get("job_revision") or "legacy",
             )
         if task_type == "image_auto_rename":
-            return "rename:{mode}:{stage}:{meme}:{sha}:{storage}:{title}:r{revision}".format(
+            return "rename:{mode}:{stage}:{meme}:{sha}:{storage}:{display}:{title}:r{revision}".format(
                 mode=mode,
                 stage=stage,
                 meme=payload.get("meme_id"),
                 sha=payload.get("image_sha256"),
                 storage=payload.get("expected_storage_key"),
+                display=payload.get("expected_display_name"),
                 title=payload.get("title_fingerprint"),
                 revision=payload.get("job_revision") or "legacy",
             )
@@ -312,6 +313,8 @@ class PostgresTaskService:
             submission_mode=getattr(record, "submission_mode", None),
             image_stage=getattr(record, "image_stage", None),
             processing_job_id=str(getattr(record, "processing_job_id", "")) if getattr(record, "processing_job_id", None) else None,
+            target_meme_id=str(getattr(record, "target_meme_id", "")) if getattr(record, "target_meme_id", None) else None,
+            target_image_sha256=getattr(record, "target_image_sha256", None),
             lane_resource_key=getattr(record, "lane_resource_key", GLOBAL_LANE_RESOURCE_KEY) or GLOBAL_LANE_RESOURCE_KEY,
             payload=dict(record.payload or {}),
             visual_snapshot_sha256=getattr(record, "visual_snapshot_sha256", None),
@@ -1196,7 +1199,9 @@ class PostgresTaskService:
                 if submission_mode is not None:
                     payload["submission_mode"] = submission_mode
         dedupe = self._dedupe(task_type, payload)
-        if task_type == "meme_context_generation":
+        if task_type == "meme_context_generation" and payload.get("_user_image_submission") is not True:
+            # 用户图片请求的活动排他必须在 TaskRepository 的同图锁内完成；先做
+            # 旧的策略冲突预检会把并发活动误报成 generation_policy_conflict。
             self._context_policy_conflict(payload, dedupe)
         with self.resources.environment(self.scope.scope_id) as environment:
             try:

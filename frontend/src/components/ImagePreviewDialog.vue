@@ -276,6 +276,13 @@ function stageErrorMessage(stage: ImageProcessingStage): string {
   return metadataErrorText(stage.error?.error || stage.error?.message) || '阶段失败'
 }
 
+/** 将固定计划的 skipped 原因翻译为详情中的直白说明。 */
+function stagePlanMessage(stage: ImageProcessingStage): string {
+  if (stage.skip_reason === 'disabled') return '本次未启用'
+  if (stage.skip_reason === 'already_ready') return '已有结果，本次无需执行'
+  return '本次未执行'
+}
+
 /** 判断当前详情中的阶段恢复按钮是否应可用，沿用图库既有的安全条件。 */
 function canRetryStage(stage: ImageProcessingStage): boolean {
   return retryableStages.value.some((candidate) => candidate.stage === stage.stage)
@@ -423,6 +430,7 @@ void loadMetadata()
                   <strong>{{ imageStageLabel(stage.stage) }}</strong>
                   <span>{{ imageStageStatusLabel(stage.status) }}</span>
                 </div>
+                <p v-if="stage.status === 'skipped'" class="image-processing-stage-plan">{{ stagePlanMessage(stage) }}</p>
                 <p v-if="stage.error" class="image-processing-stage-error">原因：{{ stageErrorMessage(stage) }}</p>
                 <button
                   v-if="stageRecoveryEnabled === true && canRetryStage(stage)"

@@ -12,6 +12,7 @@ from backend.persistence.models import (
     EMBEDDING_DIMENSIONS,
     Meme,
     ScopeContext,
+    utcnow,
 )
 from backend.persistence.engine import DatabaseError
 from backend.persistence.resources import DatabaseResources
@@ -56,7 +57,7 @@ class PostgresSearchService:
     def has_cache(self) -> bool:
         """检查当前 scope/model 的唯一检索来源是否已有有效数据。"""
         with self.resources.environment(self.scope.scope_id) as environment:
-            return environment.search.source_mode(self.model) == "incremental" and environment.search.has_incremental(self.model)
+            return environment.search.has_incremental(self.model)
 
     def invalidate_cache(self) -> None:
         """数据库索引不在进程内缓存；此方法保留兼容调用但无副作用。"""
@@ -70,7 +71,12 @@ class PostgresSearchService:
             return environment.search.valid_text_embedding_ids(self.model, memes)
 
     def generate_cache(self, progress: Callable[[float | None, str | None], None], claim: tuple[str, int, str] | None = None) -> dict[str, object]:
-        """按当前可索引候选回填增量文本向量，完成后切换 scope 迁移状态。"""
+        """按当前可索引候选回填增量文本向量，完成后切换 scope 迁移状态。
+
+        候选读取使用 Meme UUID keyset 分页，避免把一个 scope 的全部 ORM 行同时
+        装入内存。不可索引或无法验证原图的记录只计入跳过报告；一旦记录进入候选，
+        后续 embedding 或版本校验失败就直接中止迁移，不把失败伪装成跳过。
+        """
         with self._generation_lock:
             preflight = self.resources.search_rebuild_preflight(self.scope)
             if preflight["blocking"]:
@@ -78,48 +84,92 @@ class PostgresSearchService:
                 raise RuntimeError("search_rebuild_preflight_failed")
             candidates: list[tuple[UUID, int, str, str, str]] = []
             skipped = 0
+            skipped_by_reason: dict[str, int] = {}
+            after_id: UUID | None = None
+            while True:
+                with self.resources.environment(self.scope.scope_id) as environment:
+                    environment.search.assert_claim(claim)
+                    page = environment.memes.list_rebuild_page(after_id=after_id, limit=200)
+                    if not page:
+                        break
+                    page_last_id = page[-1].id
+                    for meme in page:
+                        reason: str | None = None
+                        if meme.context_status not in {"partial", "ready"}:
+                            reason = "metadata_unavailable"
+                        try:
+                            context = MemeContext.model_validate(meme.meme_context or {})
+                        except (TypeError, ValueError):
+                            reason = "metadata_invalid"
+                            context = None
+                        if reason is None:
+                            try:
+                                image = self.metadata.blob_store.resolve(meme.storage_key)
+                                identity = self.metadata._identity(image)
+                            except (DatabaseError, MetadataError, OSError, ValueError):
+                                reason = "image_unavailable"
+                            else:
+                                if identity["sha256"] != meme.sha256 or identity["size_bytes"] != meme.size_bytes:
+                                    reason = "image_identity_mismatch"
+                        if reason is not None:
+                            skipped += 1
+                            skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
+                            continue
+                        text_value = semantic_document(context)
+                        if not text_value:
+                            skipped += 1
+                            skipped_by_reason["semantic_text_empty"] = skipped_by_reason.get("semantic_text_empty", 0) + 1
+                            continue
+                        metadata_hash = semantic_document_hash(context)
+                        if metadata_hash is None:
+                            skipped += 1
+                            skipped_by_reason["semantic_text_empty"] = skipped_by_reason.get("semantic_text_empty", 0) + 1
+                            continue
+                        stored_metadata_hash = getattr(meme, "search_metadata_hash", None)
+                        if stored_metadata_hash != metadata_hash:
+                            # 回填前物化当前 canonical hash；旧 hash 对应的向量会在
+                            # begin_incremental_backfill 中清掉，不能继续沿用历史事实。
+                            meme.search_metadata_hash = metadata_hash
+                            meme.updated_at = utcnow()
+                        candidates.append((meme.id, meme.revision, str(meme.sha256).lower(), text_value, metadata_hash))
+                    after_id = page_last_id
+                if len(page) < 200:
+                    # keyset 查询已经到达当前快照末尾；若并发新增更大的 UUID，最终
+                    # 候选覆盖校验会发现它，不会静默发布不完整索引。
+                    break
+
+            candidates.sort(key=lambda item: str(item[0]))
+            # 空候选也必须先把旧来源冻结为 backfill，并清掉当前模型的旧行；否则
+            # 失败迁移会继续暴露旧 generation 或上一次增量结果。
             with self.resources.environment(self.scope.scope_id) as environment:
                 environment.search.assert_claim(claim)
-                for meme in environment.memes.list_all():
-                    try:
-                        image = self.metadata.blob_store.resolve(meme.storage_key)
-                        identity = self.metadata._identity(image)
-                        context = MemeContext.model_validate(meme.meme_context or {})
-                    except (DatabaseError, MetadataError, ValueError):
-                        skipped += 1
-                        continue
-                    if identity["sha256"] != meme.sha256 or identity["size_bytes"] != meme.size_bytes or meme.context_status not in {"partial", "ready"}:
-                        skipped += 1
-                        continue
-                    text_value = semantic_document(context)
-                    if not text_value:
-                        skipped += 1
-                        continue
-                    metadata_hash = meme.search_metadata_hash or semantic_document_hash(context)
-                    if metadata_hash is None:
-                        skipped += 1
-                        continue
-                    candidates.append((meme.id, meme.revision, meme.sha256, text_value, metadata_hash))
-                if not candidates:
-                    raise RuntimeError("no_indexable_images")
-                candidates.sort(key=lambda item: str(item[0]))
-                state = environment.search.begin_incremental_backfill(self.model, total_count=len(candidates))
+                state = environment.search.begin_incremental_backfill(self.model, total_count=len(candidates), claim=claim)
                 epoch = state.epoch
+            if not candidates:
+                raise RuntimeError("no_indexable_images")
             total = len(candidates)
             from backend.image_processing import SingleImageEmbeddingService
 
             embedding_service = SingleImageEmbeddingService(self.resources, scope_id=self.scope, model=self.model, embedder=self._embedding)
             for index, (meme_id, _revision, image_sha, text_value, metadata_hash) in enumerate(candidates, start=1):
-                embedding_service.upsert(meme_id, image_sha256=image_sha, metadata_hash=metadata_hash, semantic_document=text_value)
+                embedding_service.upsert(meme_id, image_sha256=image_sha, metadata_hash=metadata_hash, semantic_document=text_value, claim=claim)
                 with self.resources.environment(self.scope.scope_id) as environment:
-                    if not environment.search.record_incremental_backfill(epoch=epoch, completed_count=index, model=self.model):
+                    if not environment.search.record_incremental_backfill(epoch=epoch, completed_count=index, model=self.model, claim=claim):
                         raise DatabaseError("migration_epoch_changed")
                 if progress:
                     progress(index / total, f"正在生成 pgvector 索引 {index}/{total}")
             with self.resources.environment(self.scope.scope_id) as environment:
-                if not environment.search.switch_incremental_only(epoch=epoch, model=self.model):
+                expected_candidates = [(meme_id, image_sha, metadata_hash) for meme_id, _revision, image_sha, _text, metadata_hash in candidates]
+                if not environment.search.switch_incremental_only(epoch=epoch, model=self.model, expected_candidates=expected_candidates, claim=claim):
                     raise DatabaseError("migration_incomplete")
-            return {"indexed_count": total, "skipped_count": skipped, "epoch": epoch, "model": self.model, "dimensions": EMBEDDING_DIMENSIONS}
+            return {
+                "indexed_count": total,
+                "skipped_count": skipped,
+                "skipped_by_reason": skipped_by_reason,
+                "epoch": epoch,
+                "model": self.model,
+                "dimensions": EMBEDDING_DIMENSIONS,
+            }
 
     def _enhance_query(self, query: str) -> str:
         """使用可选 LLM 改写查询；失败由 API 回退普通查询。"""

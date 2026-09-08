@@ -7,7 +7,6 @@ services、数据库环境、处理 repository、视觉 identity 和路由注册
 
 from __future__ import annotations
 
-import inspect
 import mimetypes
 from collections.abc import Callable
 from typing import Any
@@ -16,6 +15,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse
 
 from backend.database import DatabaseError
+from backend.image_naming import public_filename_fields, saved_filename
 from backend.metadata import MetadataError
 from backend.services.thumbnails import ThumbnailError
 
@@ -25,6 +25,7 @@ EnvironmentProvider = Callable[[Request], Any]
 ProcessingRepositoryProvider = Callable[[Request], Any]
 VisualIdentityProvider = Callable[[Request], Any]
 ErrorFactory = Callable[[int, str, str], HTTPException]
+MISSING_MEDIA_ERRORS = frozenset({"metadata_missing", "file_not_found"})
 
 
 async def list_images(
@@ -53,38 +54,15 @@ async def list_images(
         records = database_environment.memes.list(search=search, page=page, page_size=page_size)
         total = database_environment.memes.count(search=search)
     valid_records = records
-    source_identities = {record.id: (int(getattr(record, "size_bytes", 0)), str(record.sha256)) for record in records if hasattr(record, "size_bytes")}
-    compatibility_identities: dict[Any, dict[str, object]] = {}
-    # 旧测试夹具或兼容 facade 没有物化大小时仍可读取一次身份；生产 ORM 路径不进入此分支。
-    if len(source_identities) != len(records):
-        for record in records:
-            if record.id in source_identities:
-                continue
-            try:
-                image = scoped_services.metadata.blob_store.resolve(record.storage_key)
-                compatibility_identities[record.id] = scoped_services.metadata._identity(image)
-                source_identities[record.id] = (int(compatibility_identities[record.id]["size_bytes"]), str(record.sha256))
-            except (DatabaseError, MetadataError, KeyError, TypeError, ValueError):
-                source_identities[record.id] = (0, str(record.sha256))
+    # 列表只使用数据库保存的源版本事实；原图身份校验属于媒体和处理等消费字节的路径。
+    source_identities = {record.id: (record.size_bytes, str(record.sha256)) for record in records}
     items: list[dict[str, object]] = []
     identity = visual_identity(request)
     thumbnails = getattr(scoped_services, "thumbnails", None)
     projection_batch = getattr(thumbnails, "projections", None) if thumbnails is not None else None
     thumbnail_projections: dict[Any, dict[str, object]] = {}
     if callable(projection_batch) and valid_records:
-        accepts_source_identities = False
-        try:
-            projection_parameters = inspect.signature(projection_batch).parameters
-            accepts_source_identities = "source_identities" in projection_parameters or any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in projection_parameters.values()
-            )
-        except (TypeError, ValueError):
-            # 无法反射的旧 facade 使用最小 positional 形状，避免把兼容读取升级为 500。
-            accepts_source_identities = False
-        if accepts_source_identities:
-            thumbnail_projections = projection_batch(valid_records, source_identities=source_identities)
-        else:
-            thumbnail_projections = projection_batch(valid_records)
+        thumbnail_projections = projection_batch(valid_records, source_identities=source_identities)
     ready_text_embedding_ids: set[object] = set()
     ready_text_embedding_ids_fn = getattr(scoped_services.search, "valid_text_embedding_ids", None)
     if callable(ready_text_embedding_ids_fn) and valid_records:
@@ -94,41 +72,30 @@ async def list_images(
         ready_ids_fn = getattr(database_environment.visual, "ready_ids", None)
         if callable(ready_ids_fn) and valid_records:
             ready_visual_embedding_ids = set(ready_ids_fn(valid_records, model=identity.model, preprocess_version=identity.preprocess_version, dimensions=identity.dimensions))
+        visual_batch_available = callable(ready_ids_fn)
     processing = processing_repository(request)
     latest_processing_by_meme: dict[object, Any] = {}
     latest_for_targets = getattr(processing, "latest_for_targets", None)
     if callable(latest_for_targets) and valid_records:
         latest_processing_by_meme = latest_for_targets((record.id, record.sha256) for record in valid_records)
     for record in valid_records:
-        if hasattr(record, "context_status"):
-            metadata_status = {"status": record.context_status}
-        else:
-            image = scoped_services.metadata.blob_store.resolve(record.storage_key)
-            metadata_status_fn = scoped_services.metadata.status
-            try:
-                if "identity" in inspect.signature(metadata_status_fn).parameters:
-                    metadata_status = metadata_status_fn(image, identity=compatibility_identities.get(record.id))
-                else:
-                    metadata_status = metadata_status_fn(image)
-            except (TypeError, ValueError):
-                metadata_status = metadata_status_fn(image)
+        metadata_status = {"status": record.context_status}
         visual_ready = record.id in ready_visual_embedding_ids
-        if not callable(getattr(database_environment.visual, "ready_ids", None)):
-            with environment(request) as fallback_environment:
-                visual_ready = fallback_environment.visual.get(record.id, model=identity.model, preprocess_version=identity.preprocess_version, dimensions=identity.dimensions, image_sha256=record.sha256) is not None
         item: dict[str, object] = {
             "meme_id": str(record.id),
-            "filename": record.storage_key,
+            "filename": saved_filename(record.display_name, record.extension),
             "extension": record.extension,
-            "size": getattr(record, "size_bytes", 0),
+            "size": record.size_bytes,
             "media_url": f"/media/{record.id}",
             "metadata": metadata_status,
             "embedding_status": "blocked" if metadata_status.get("status") == "repair_required" else "ready" if record.id in ready_text_embedding_ids else "pending",
-            "visual_embedding_status": "ready" if visual_ready else "pending",
+            "visual_embedding_status": "ready" if visual_batch_available and visual_ready else "pending",
         }
         if thumbnails is not None:
             item["thumbnail"] = thumbnail_projections.get(record.id, {"status": "pending", "media_url": None})
-        latest_processing = latest_processing_by_meme.get(record.id) if latest_processing_by_meme else processing.latest_for_target(record.id, record.sha256)
+        latest_processing = (
+            latest_processing_by_meme.get(record.id)
+        )
         if latest_processing is not None:
             processing_public = latest_processing.as_dict()
             item.update(
@@ -160,14 +127,24 @@ async def image_metadata(
         raise error(400, "meme_id_required", "必须提供 meme_id")
     metadata_service = services(request).metadata
     try:
-        _record, image = metadata_service.image_for_meme(meme_id)
+        record, image = metadata_service.image_for_meme(meme_id)
         metadata = metadata_service.load(image)
     except MetadataError as exc:
-        status = 404 if exc.code == "metadata_missing" else 409
-        code = "meme_not_found" if exc.code == "metadata_missing" else exc.code
-        message = "图片不存在" if exc.code == "metadata_missing" else "图片元数据无法读取"
+        status = 404 if exc.code in MISSING_MEDIA_ERRORS else 409
+        code = "meme_not_found" if exc.code in MISSING_MEDIA_ERRORS else exc.code
+        message = "图片不存在" if exc.code in MISSING_MEDIA_ERRORS else "图片元数据无法读取"
         raise error(status, code, message) from exc
     payload = metadata.model_dump(mode="json", exclude_none=False)
+    try:
+        public_fields = public_filename_fields(record)
+    except ValueError as exc:
+        raise error(409, "metadata_invalid", "图片元数据无法读取") from exc
+    image_payload = payload.get("image")
+    if not isinstance(image_payload, dict):
+        raise error(409, "metadata_invalid", "图片元数据无法读取")
+    # sidecar 内部仍保留物理 relative_path 供后端校验；HTTP 响应只能返回展示文件名。
+    image_payload.update(public_fields)
+    image_payload["relative_path"] = public_fields["filename"]
     payload["meme_id"] = meme_id
     return payload
 
@@ -187,7 +164,9 @@ async def media(
     try:
         _record, path = services(request).metadata.image_for_meme(meme_id)
     except MetadataError as exc:
-        raise error(404, "meme_not_found", "图片不存在") from exc
+        if exc.code in MISSING_MEDIA_ERRORS:
+            raise error(404, "meme_not_found", "图片不存在") from exc
+        raise error(409, exc.code, "图片身份校验失败") from exc
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     return FileResponse(path, media_type=media_type, headers={"Cache-Control": "private, no-store", "Vary": "Cookie"})
 

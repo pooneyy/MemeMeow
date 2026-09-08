@@ -537,6 +537,11 @@ def public_processing_stage(value: Mapping[str, object], *, job_id: str | None =
     raw_status = value.get("status")
     status = raw_status if isinstance(raw_status, str) and raw_status in PUBLIC_STAGE_STATUSES else "failed"
     result: dict[str, object] = {"stage": stage or "unknown", "status": status}
+    if isinstance(value.get("planned"), bool):
+        result["planned"] = value["planned"]
+    skip_reason = normalize_public_code(value.get("skip_reason"))
+    if skip_reason in {"already_ready", "disabled"}:
+        result["skip_reason"] = skip_reason
     for key in ("task_id", "session_id", "executor_attempt_id"):
         identifier = normalize_public_identifier(value.get(key))
         if identifier:

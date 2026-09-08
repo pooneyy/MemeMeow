@@ -132,7 +132,7 @@ def test_rename_uses_source_extension_and_invalidates_after_metadata(tmp_path: P
         )
     )
     assert result == {"meme_id": "meme-1", "filename": "renamed.png", "media_url": "/media/meme-1"}
-    assert [name for name, _value in metadata.events] == ["image_for_meme", "resolve", "rename_by_id"]
+    assert [name for name, _value in metadata.events] == ["image_for_meme", "rename_by_id"]
     assert events == ["invalidate"]
 
 
@@ -161,27 +161,27 @@ def test_rename_rejects_unsafe_or_unsupported_target_without_metadata_write(tmp_
     assert invalidated == []
 
 
-def test_rename_target_conflict_is_checked_before_metadata_write(tmp_path: Path) -> None:
-    """目标文件冲突映射为 409 且不调用 metadata rename。"""
+def test_rename_does_not_touch_content_addressed_target_files(tmp_path: Path) -> None:
+    """展示名冲突不会检查、覆盖或移动内容寻址物理文件。"""
     source = tmp_path / "source.png"
     target = tmp_path / "taken.png"
     source.write_bytes(b"source")
     target.write_bytes(b"taken")
     metadata = _Metadata(source, tmp_path)
-    with pytest.raises(HTTPException) as caught:
-        asyncio.run(
-            image_mutation_http.rename_image(
-                _request(),
-                _payload(new_name="taken"),
-                metadata_service=lambda _request: metadata,
-                sanitize_filename=api._safe_filename,
-                validate_storage_key=_validator,
-                invalidate_search=lambda _request: None,
-                error=_error,
-            )
+    result = asyncio.run(
+        image_mutation_http.rename_image(
+            _request(),
+            _payload(new_name="taken"),
+            metadata_service=lambda _request: metadata,
+            sanitize_filename=api._safe_filename,
+            validate_storage_key=_validator,
+            invalidate_search=lambda _request: None,
+            error=_error,
         )
-    assert (caught.value.status_code, caught.value.detail["error"]) == (409, "file_exists")
-    assert all(name != "rename_by_id" for name, _value in metadata.events)
+    )
+    assert result == {"meme_id": "meme-1", "filename": "taken.png", "media_url": "/media/meme-1"}
+    assert target.read_bytes() == b"taken"
+    assert [name for name, _value in metadata.events] == ["image_for_meme", "rename_by_id"]
 
 
 def test_delete_commits_after_metadata_and_keeps_success_on_commit_failure(tmp_path: Path) -> None:

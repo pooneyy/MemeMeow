@@ -189,3 +189,85 @@ def test_image_processing_submission_maps_option_error_before_page_read() -> Non
     assert caught.value.status_code == 400
     assert caught.value.detail["error"] == "invalid_reverse_image_policy"
     assert called == [True]
+
+
+def test_scope_repair_reports_images_that_are_already_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """scope 修复必须把无需处理的图片保留在逐图结果和汇总计数中。"""
+    records = [_record("ready-a.png"), _record("ready-b.png")]
+    scalar_calls = 0
+
+    class _ScopeEnvironment:
+        """提供两页可控 Meme 记录的最小 scope 环境。"""
+
+        def __init__(self) -> None:
+            self.uow = SimpleNamespace(session=SimpleNamespace(scalars=self.scalars))
+
+        def scalars(self, _statement):
+            """首次返回图片，下一页返回空集合。"""
+            nonlocal scalar_calls
+            scalar_calls += 1
+            return records if scalar_calls == 1 else []
+
+        def __enter__(self) -> "_ScopeEnvironment":
+            """进入测试环境。"""
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+            """退出测试环境。"""
+            del exc_type, exc, traceback
+
+    metadata = SimpleNamespace(blob_store=SimpleNamespace(resolve=lambda key: Path("/scope") / key))
+    worker = SimpleNamespace(submit=lambda *_args, **_kwargs: pytest.fail("已就绪图片不应创建修复 Job"))
+    monkeypatch.setattr(api, "_normalize_processing_options", lambda *_args, **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(api, "_processing_worker", lambda _request: worker)
+    monkeypatch.setattr(api, "_environment", lambda _request: _ScopeEnvironment())
+    monkeypatch.setattr(api, "_request_scope", lambda _request: SimpleNamespace(scope_id="local"))
+    monkeypatch.setattr(api, "_service", lambda _request, _name: metadata)
+    monkeypatch.setattr(api, "_core_image_ready", lambda *_args, **_kwargs: True)
+
+    payload = api.ProcessingBatchRequest(reverse_image_policy="forbid", auto_name=False)
+    result = asyncio.run(api.process_unready_image_library(SimpleNamespace(query_params={}), payload))
+
+    assert result["target_count"] == 2
+    assert result["submitted_count"] == 0
+    assert result["not_needed_count"] == 2
+    assert result["conflict_count"] == 0
+    assert result["failed_count"] == 0
+    assert result["results"] == [
+        {"meme_id": str(records[0].id), "reason": "already_ready", "category": "not_needed"},
+        {"meme_id": str(records[1].id), "reason": "already_ready", "category": "not_needed"},
+    ]
+
+
+def test_core_image_ready_does_not_hide_active_standalone_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    """活动独立阶段不能被 scope 修复的就绪判断吞掉。"""
+    record = SimpleNamespace(id=uuid4(), sha256="a" * 64)
+    repository = SimpleNamespace(
+        latest_for_target=lambda *_args: None,
+        has_active_image_task=lambda *_args: True,
+    )
+    monkeypatch.setattr(api, "_processing_repository", lambda _request: repository)
+
+    assert api._core_image_ready(SimpleNamespace(), record, Path("/scope/image.png"), "forbid") is False
+
+
+def test_core_image_ready_requires_auto_name_stage_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """启用自动命名时，历史 disabled 阶段必须重新进入修复计划。"""
+    record = SimpleNamespace(id=uuid4(), sha256="a" * 64)
+    latest = SimpleNamespace(
+        status="succeeded",
+        reverse_image_policy="forbid",
+        stages=[
+            {"stage": "visual", "status": "succeeded"},
+            {"stage": "agent", "status": "succeeded"},
+            {"stage": "auto_rename", "status": "skipped", "skip_reason": "disabled"},
+            {"stage": "text_embedding", "status": "succeeded"},
+        ],
+    )
+    repository = SimpleNamespace(
+        latest_for_target=lambda *_args: latest,
+        has_active_image_task=lambda *_args: False,
+    )
+    monkeypatch.setattr(api, "_processing_repository", lambda _request: repository)
+
+    assert api._core_image_ready(SimpleNamespace(), record, Path("/scope/image.png"), "forbid", auto_name=True) is False

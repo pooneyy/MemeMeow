@@ -312,7 +312,11 @@ def test_upload_retry_reports_reconciliation_when_file_fact_changes(client):
     content = png_bytes("red")
     first = test_client.post("/images/upload", files=[("files", ("reconcile.png", content, "image/png"))])
     assert first.status_code == 200
-    (tmp_path / "images" / "reconcile.png").write_bytes(png_bytes("blue"))
+    with test_client.app.state.database.environment("local") as environment:
+        record = environment.memes.get(first.json()["results"][0]["meme_id"])
+        assert record is not None
+        physical_image = test_client.app.state.metadata.blob_store.resolve(record.storage_key)
+    physical_image.write_bytes(png_bytes("blue"))
     response = test_client.post("/images/upload", files=[("files", ("reconcile.png", content, "image/png"))])
     assert response.status_code == 200
     assert response.json()["results"][0]["error"] == "upload_reconciliation_required"
@@ -336,11 +340,14 @@ def test_multi_upload_seals_visual_batch(client):
 
 def test_image_metadata_returns_complete_database_record(client):
     """图片库详情接口只返回受控 Meme 对应的完整数据库元数据。"""
-    test_client, tmp_path = client
+    test_client, _ = client
     response = test_client.post("/images/upload", files=[("files", ("detail.png", png_bytes(), "image/png"))])
     assert response.status_code == 200
     meme_id = response.json()["results"][0]["meme_id"]
-    image = tmp_path / "images" / "detail.png"
+    with test_client.app.state.database.environment("local") as environment:
+        record = environment.memes.get(meme_id)
+        assert record is not None
+        image = test_client.app.state.metadata.blob_store.resolve(record.storage_key)
     test_client.app.state.metadata.update_context(image, {"summary": "详情摘要", "keywords": ["测试"]}, producer="human", status="ready")
 
     metadata = test_client.get("/images/metadata", params={"meme_id": meme_id})
@@ -362,7 +369,7 @@ def test_image_metadata_requires_stable_id_and_reports_unknown_meme(client):
 
 
 def test_batch_upload_keeps_success_and_reports_failure(client):
-    """批量上传允许部分成功且不覆盖重复文件。"""
+    """批量上传允许部分成功且按内容身份幂等复用重复文件。"""
     test_client, _ = client
     response = test_client.post(
         "/images/upload",
@@ -374,8 +381,11 @@ def test_batch_upload_keeps_success_and_reports_failure(client):
     )
     results = response.json()["results"]
     assert [item["ok"] for item in results] == [True, False, False]
-    duplicate = test_client.post("/images/upload", files=[("files", ("good.png", png_bytes("blue"), "image/png"))])
-    assert duplicate.json()["results"][0]["error"] == "file_exists"
+    duplicate = test_client.post("/images/upload", files=[("files", ("good-copy.png", png_bytes(), "image/png"))])
+    duplicate_item = duplicate.json()["results"][0]
+    assert duplicate_item["ok"] is True
+    assert duplicate_item["idempotent"] is True
+    assert duplicate_item["meme_id"] == results[0]["meme_id"]
 
 
 def test_upload_queues_context_job_and_removed_vlm_routes_are_not_found(client):
@@ -403,20 +413,26 @@ def test_collection_import_starts_with_visual_task(client):
 
 
 def test_removed_directory_contract_and_rename_conflicts(client):
-    """目录接口永久删除，重命名仍拒绝重复目标。"""
-    test_client, tmp_path = client
+    """目录接口永久删除，展示名可以重复且物理内容仍独立。"""
+    test_client, _ = client
     assert test_client.get("/images/directories").status_code == 404
     assert test_client.post("/images/directories", json={"name": "work"}).status_code == 404
     one = test_client.post("/images/upload", files=[("files", ("one.png", png_bytes(), "image/png"))]).json()["results"][0]
     two = test_client.post("/images/upload", files=[("files", ("two.png", png_bytes("blue"), "image/png"))]).json()["results"][0]
-    conflict = test_client.post("/images/rename", json={"meme_id": one["meme_id"], "new_name": "two"})
-    assert conflict.status_code == 409
+    renamed_duplicate = test_client.post("/images/rename", json={"meme_id": one["meme_id"], "new_name": "two"})
+    assert renamed_duplicate.status_code == 200
+    assert renamed_duplicate.json()["filename"] == "two.png"
     renamed = test_client.post("/images/rename", json={"meme_id": one["meme_id"], "new_name": "first"})
     assert renamed.status_code == 200
     assert renamed.json()["meme_id"] == one["meme_id"]
     assert renamed.json()["filename"] == "first.png"
     assert test_client.get(f"/media/{one['meme_id']}").status_code == 200
     assert test_client.get(f"/media/{two['meme_id']}").status_code == 200
+    with test_client.app.state.database.environment("local") as environment:
+        first_record = environment.memes.get(one["meme_id"])
+        second_record = environment.memes.get(two["meme_id"])
+        assert first_record is not None and second_record is not None
+        assert first_record.storage_key != second_record.storage_key
 
 
 def test_delete_removes_image_and_database_record(client):
@@ -500,7 +516,16 @@ def test_search_maps_results_to_media_urls(client):
     test_client.app.state.search_engine = FakeSearch()
     response = test_client.post("/search", json={"query": "x", "n_results": 3})
     assert response.status_code == 200
-    assert response.json() == {"results": [f"/media/{meme_id}"]}
+    assert response.json() == {
+        "results": [f"/media/{meme_id}"],
+        "result_media": [
+            {
+                "meme_id": meme_id,
+                "media_url": f"/media/{meme_id}",
+                "thumbnail": {"status": "pending", "media_url": None},
+            }
+        ],
+    }
 
 
 def test_llm_failure_falls_back_to_original_query(client):
@@ -557,10 +582,18 @@ def test_parallel_context_batch_writes_independent_database_records_and_incremen
     monkeypatch.setenv("MEMEMEOW_OPENCODE_MODEL", "")
     monkeypatch.setenv("MEMEMEOW_AGENT_CALLBACK_SECRET", "test-agent-callback-secret-1234")
     monkeypatch.setenv("MEMEMEOW_OPENCODE_CONCURRENCY", "2")
+    monkeypatch.setenv("MEMEMEOW_AGENT_SCOPE_CONCURRENCY", "2")
     _clear_test_scope()
     with TestClient(app) as test_client:
+        def hold_schedule(_worker, _job_id):
+            """在测试替换视觉和 Agent 依赖前暂缓上传产生的 Job。"""
+            return None
+
+        original_schedule = ImageProcessingWorker.schedule
+        monkeypatch.setattr(ImageProcessingWorker, "schedule", hold_schedule)
         first = test_client.post("/images/upload", files=[("files", ("parallel-a.png", png_bytes("red"), "image/png"))]).json()["results"][0]
         second = test_client.post("/images/upload", files=[("files", ("parallel-b.png", png_bytes("blue"), "image/png"))]).json()["results"][0]
+        monkeypatch.setattr(ImageProcessingWorker, "schedule", original_schedule)
         started = threading.Barrier(2)
         sessions: list[str] = []
 
@@ -608,10 +641,15 @@ def test_parallel_context_batch_writes_independent_database_records_and_incremen
         assert submitted.status_code == 200
         task_ids = [item["task_id"] for item in submitted.json()["results"]]
         assert len(task_ids) == 2
+        with test_client.app.state.database.environment("local") as environment:
+            expected_sessions = {
+                environment.memes.get(first["meme_id"]).storage_key,
+                environment.memes.get(second["meme_id"]).storage_key,
+            }
         deadline = time.monotonic() + 5
         while len(sessions) < 2 and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert set(sessions) == {"parallel-a.png", "parallel-b.png"}
+        assert set(sessions) == expected_sessions
         for task_id in task_ids:
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
@@ -673,7 +711,7 @@ def test_pending_agent_ready_sidecar_and_v4_embedding_pipeline_is_backend_owned(
             runner = test_client.app.state.opencode
             draft_path, result_path = runner.create_task_result_paths(task_id)
             candidate = {
-                "title": image.stem.replace("-", " "),
+                "title": "pending agent",
                 "summary": "后端拥有 canonical 写回",
                 "subjects": ["测试图片"],
                 "visible_text": [],
@@ -690,7 +728,9 @@ def test_pending_agent_ready_sidecar_and_v4_embedding_pipeline_is_backend_owned(
             # Agent artifact 路径中，最终写回由 context_handler 的白名单完成。
             draft_path.write_text(json.dumps(candidate, ensure_ascii=False), encoding="utf-8")
             draft_path.replace(result_path)
-            return runner.read_result_file(result_path), f"session-{image.stem}"
+            # 这里直接返回候选，专门覆盖后端 canonical 写回的字段白名单；结果
+            # 文件读取器对未知顶层字段会严格拒绝，该边界由 OpenCode 单测覆盖。
+            return candidate, "pending-session"
 
         monkeypatch.setattr(test_client.app.state.visual_inference, "embed", fake_visual_embed)
         monkeypatch.setattr(test_client.app.state.search_engine, "_embedding", fake_text_embedding)
@@ -831,11 +871,14 @@ def test_auto_name_pipeline_renames_safely_and_freezes_final_metadata_hash(tmp_p
         metadata = test_client.get("/images/metadata", params={"meme_id": result["meme_id"]}).json()
         assert metadata["image"]["relative_path"] == "Project Launch v2.png"
         assert not (tmp_path / "images" / "original-name.png").exists()
-        assert (tmp_path / "images" / "Project Launch v2.png").exists()
 
         with test_client.app.state.database.environment("local") as environment:
             meme = environment.memes.get(result["meme_id"])
             assert meme is not None
+            assert meme.display_name == "Project Launch v2"
+            physical_image = tmp_path / "images" / meme.storage_key
+            assert physical_image.exists()
+            assert not (tmp_path / "images" / "Project Launch v2.png").exists()
             final_hash = ImageProcessingWorker._metadata_hash(meme)
             assert final_hash is not None
             rename_task = environment.tasks.get(
@@ -1038,8 +1081,8 @@ def test_selected_stage_batch_validates_core_mapping_and_submits_independent_tas
     assert all(item.get("task_id") or item.get("error") for item in body["results"])
 
 
-def test_standalone_auto_rename_invalidates_old_text_embedding_without_creating_job(tmp_path, monkeypatch):
-    """独立自动重命名成功后必须失效旧向量，且不能创建父 Job 或文本任务。"""
+def test_standalone_auto_rename_preserves_current_text_embedding_without_creating_job(tmp_path, monkeypatch):
+    """内容寻址图片仅更新展示名时保留语义向量，且不能创建父 Job 或文本任务。"""
     monkeypatch.setenv("MEMEMEOW_DATABASE_URL", os.getenv("MEMEMEOW_TEST_DATABASE_URL", ""))
     monkeypatch.setenv("MEMEMEOW_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("MEMEMEOW_IMAGE_ROOT", str(tmp_path / "images"))
@@ -1095,7 +1138,9 @@ def test_standalone_auto_rename_invalidates_old_text_embedding_without_creating_
         with test_client.app.state.database.environment("local") as environment:
             record = environment.memes.get(meme_id)
             assert record is not None
-            assert record.storage_key == "Standalone renamed.png"
+            assert record.display_name == "Standalone renamed"
+            assert record.storage_key == Path(image).name
+            assert Path(image).exists()
             row = environment.uow.session.scalar(
                 select(MemeTextEmbedding).where(
                     MemeTextEmbedding.scope_id == "local",
@@ -1105,7 +1150,8 @@ def test_standalone_auto_rename_invalidates_old_text_embedding_without_creating_
                 )
             )
             assert row is not None
-            assert row.status == "failed"
+            # storage_key 和七字段语义 hash 均未变化，展示名不是文本向量输入。
+            assert row.status == "ready"
             assert environment.uow.session.scalar(select(Task).where(Task.task_type == "text_embedding_generation")) is None
             assert environment.uow.session.scalar(select(Task).where(Task.processing_job_id.is_not(None))) is None
     _clear_test_scope()

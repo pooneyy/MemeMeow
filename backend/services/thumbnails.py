@@ -424,12 +424,12 @@ class DerivedThumbnailService:
             return
         try:
             self.enqueue(meme_id)
-        except (ThumbnailError, DatabaseError) as exc:
+        except Exception as exc:  # noqa: BLE001 - 列表补齐失败不得阻断当前页投影
             logger.warning(
                 "thumbnail_projection_enqueue_deferred scope=%s meme=%s error=%s",
                 self.scope.scope_id,
                 meme_id,
-                exc.code,
+                getattr(exc, "code", None) or str(exc),
             )
 
     def _enqueue_from_projection_batch(self, meme_ids: list[UUID]) -> None:
@@ -438,12 +438,12 @@ class DerivedThumbnailService:
             return
         try:
             self.enqueue_many(meme_ids)
-        except (ThumbnailError, DatabaseError) as exc:
+        except Exception as exc:  # noqa: BLE001 - 列表补齐失败不得阻断当前页投影
             logger.warning(
                 "thumbnail_projection_enqueue_batch_failed scope=%s count=%s error=%s",
                 self.scope.scope_id,
                 len(meme_ids),
-                exc.code,
+                getattr(exc, "code", None) or str(exc),
             )
 
     def projection_for_meme_id(self, meme_id: UUID | str) -> dict[str, object]:
@@ -465,11 +465,24 @@ class DerivedThumbnailService:
         pending_ids: list[UUID] = []
         with self.resources.environment(self.scope) as environment:
             rows = environment.thumbnails.list_current(memes, self.config.profile)
+            missing_memes = [
+                meme
+                for meme in memes
+                if meme.id not in rows
+                and self._source_identity_error(
+                    meme,
+                    source_identities.get(meme.id) if source_identities is not None else None,
+                )
+                is None
+            ]
+            ensure_many = getattr(environment.thumbnails, "ensure_pending_many", None)
+            if missing_memes and callable(ensure_many):
+                rows.update(ensure_many(missing_memes, self.config.profile))
             for meme in memes:
                 row = rows.get(meme.id)
                 source_identity = source_identities.get(meme.id) if source_identities is not None else None
                 source_error = self._source_identity_error(meme, source_identity)
-                if row is None and source_error is None:
+                if row is None and source_error is None and not callable(ensure_many):
                     try:
                         row = environment.thumbnails.ensure_pending(meme, self.config.profile)
                     except DatabaseError as exc:
@@ -704,16 +717,42 @@ class DerivedThumbnailService:
                 try:
                     if self.enqueue(meme_id) is not None:
                         submitted += 1
-                except (ThumbnailError, DatabaseError, RuntimeError, AttributeError) as exc:
+                except Exception as exc:  # noqa: BLE001 - 单项提交失败只保留 pending 事实
                     logger.warning("thumbnail_enqueue_failed scope=%s meme=%s error=%s", self.scope.scope_id, meme_id, getattr(exc, "code", None) or str(exc))
             return submitted
         payloads: list[dict[str, object]] = []
         with self.resources.environment(self.scope) as environment:
-            for meme_id in meme_ids:
-                meme = environment.memes.get(meme_id)
-                if meme is None:
+            identifiers: list[UUID] = []
+            for value in meme_ids:
+                try:
+                    identifier = value if isinstance(value, UUID) else UUID(str(value))
+                except (TypeError, ValueError):
                     continue
-                row = environment.thumbnails.ensure_pending(meme, self.config.profile)
+                if identifier not in identifiers:
+                    identifiers.append(identifier)
+            if not identifiers:
+                return 0
+            memes = list(
+                environment.uow.session.scalars(
+                    select(Meme).where(
+                        Meme.scope_id == self.scope.scope_id,
+                        Meme.id.in_(tuple(identifiers)),
+                    )
+                )
+            )
+            ensure_many = getattr(environment.thumbnails, "ensure_pending_many", None)
+            rows = (
+                ensure_many(memes, self.config.profile)
+                if callable(ensure_many)
+                else {
+                    meme.id: environment.thumbnails.ensure_pending(meme, self.config.profile)
+                    for meme in memes
+                }
+            )
+            for meme in memes:
+                row = rows.get(meme.id)
+                if row is None:
+                    continue
                 if row.status in {"failed", "stale"}:
                     continue
                 if row.status == "available" and self._output_is_valid(meme, row):
@@ -733,7 +772,7 @@ class DerivedThumbnailService:
                 else:
                     self.task_service.submit(self.TASK_TYPE, payload)
                 submitted += 1
-            except (DatabaseError, RuntimeError, ThumbnailError) as exc:
+            except Exception as exc:  # noqa: BLE001 - 单项提交失败只保留 pending 事实
                 logger.warning(
                     "thumbnail_enqueue_failed scope=%s meme=%s error=%s",
                     self.scope.scope_id,

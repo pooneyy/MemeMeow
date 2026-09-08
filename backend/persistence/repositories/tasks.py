@@ -20,6 +20,7 @@ from executor.agent_limits import validate_agent_concurrency, validate_agent_con
 from backend.persistence.engine import DatabaseError
 from backend.persistence.models import (
     Meme,
+    ImageProcessingJob,
     Scope,
     ScopeContext,
     Task,
@@ -48,6 +49,19 @@ IMAGE_PROCESSING_LANE_TYPES = frozenset(
         "text_embedding_generation",
     }
 )
+
+
+def _exclude_explicit_image_pipeline() -> Any:
+    """返回排除显式图片 pipeline、保留迁移前 NULL 来源任务的条件。"""
+    # 对含 NULL 的组合谓词直接取反会得到 UNKNOWN；显式保留 NULL 才能让旧图片
+    # 任务继续由兼容 Worker 恢复和认领。
+    return or_(
+        Task.submission_mode.is_(None),
+        ~(
+            Task.task_type.in_(IMAGE_PROCESSING_LANE_TYPES)
+            & Task.submission_mode.in_(("pipeline", "standalone"))
+        ),
+    )
 
 
 def _validate_lane_capacities(lane_capacity: object | None, scope_capacity: object | None) -> tuple[int | None, int | None]:
@@ -347,6 +361,8 @@ class TaskRepository:
         submission_mode: str | None = None,
         image_stage: str | None = None,
         processing_job_id: UUID | str | None = None,
+        target_meme_id: UUID | str | None = None,
+        target_image_sha256: str | None = None,
     ) -> Task:
         """在事务中插入或复用活动任务，并保存图片提交来源事实。
 
@@ -354,6 +370,7 @@ class TaskRepository:
         历史测试任务，未提供来源时保留 NULL，但任何带来源的新图片任务都会在
         这里校验阶段、Job 关联和模式互斥关系。
         """
+        user_image_submission = payload.pop("_user_image_submission", False) is True
         image_task_stages = {
             "visual_embedding_generation": "visual",
             "meme_context_generation": "agent",
@@ -389,6 +406,54 @@ class TaskRepository:
                 raise DatabaseError("image_task_job_conflict")
             if submission_mode == "standalone" and payload.get("job_id") is not None:
                 raise DatabaseError("image_task_job_conflict")
+            candidate_meme = target_meme_id or payload.get("meme_id")
+            if candidate_meme is not None:
+                try:
+                    target_meme_id = UUID(str(candidate_meme))
+                except (TypeError, ValueError) as exc:
+                    raise DatabaseError("image_target_meme_invalid") from exc
+            candidate_sha = target_image_sha256 or payload.get("image_sha256")
+            if candidate_sha is not None:
+                if not isinstance(candidate_sha, str) or len(candidate_sha) != 64 or any(char not in "0123456789abcdefABCDEF" for char in candidate_sha):
+                    raise DatabaseError("image_target_sha_invalid")
+                target_image_sha256 = candidate_sha.lower()
+            if explicit_source:
+                # 新图片任务必须把目标身份写入结构化列，不能让活动排他依赖
+                # payload 猜测；提交事务内同时确认目标仍属于当前 scope 和当前 SHA。
+                if target_meme_id is None or target_image_sha256 is None:
+                    raise DatabaseError("image_target_required")
+                if user_image_submission:
+                    # 用户新请求必须先拿到图片级事务锁，再读取当前 Meme、Job 和
+                    # Task；这样检查和插入不会被另一种图片处理模式穿过窗口。
+                    self._lock_image_submission(target_meme_id, target_image_sha256)
+                target_meme = self.session.scalar(
+                    select(Meme).where(
+                        Meme.scope_id == self.scope.scope_id,
+                        Meme.id == target_meme_id,
+                    )
+                )
+                if target_meme is None or str(target_meme.sha256).lower() != target_image_sha256:
+                    raise DatabaseError("image_target_changed")
+                if submission_mode == "pipeline":
+                    job = self.session.scalar(
+                        select(ImageProcessingJob).where(
+                            ImageProcessingJob.scope_id == self.scope.scope_id,
+                            ImageProcessingJob.id == processing_job_id,
+                        )
+                    )
+                    if job is None or job.meme_id != target_meme_id or str(job.image_sha256).lower() != target_image_sha256:
+                        raise DatabaseError("image_processing_job_invalid")
+            if user_image_submission and target_meme_id is not None and target_image_sha256 is not None:
+                active_job = self.session.scalar(
+                    select(ImageProcessingJob.id).where(
+                        ImageProcessingJob.scope_id == self.scope.scope_id,
+                        ImageProcessingJob.meme_id == target_meme_id,
+                        ImageProcessingJob.image_sha256 == target_image_sha256,
+                        ImageProcessingJob.status.in_(("queued", "running")),
+                    )
+                )
+                if active_job is not None or self._has_active_target_task(target_meme_id, target_image_sha256):
+                    raise DatabaseError("image_processing_active")
         try:
             lane_resource_key = validate_lane_resource_key(lane_resource_key)
         except ValueError as exc:
@@ -422,6 +487,8 @@ class TaskRepository:
             submission_mode=submission_mode,
             image_stage=image_stage,
             processing_job_id=processing_job_id,
+            target_meme_id=target_meme_id,
+            target_image_sha256=target_image_sha256,
             lane=lane,
             lane_resource_key=lane_resource_key,
             payload=payload,
@@ -447,6 +514,26 @@ class TaskRepository:
                     return existing
             raise DatabaseError("task_submit_conflict")
         return task
+
+    def _lock_image_submission(self, meme_id: UUID, image_sha256: str) -> None:
+        """锁住用户新提交的图片，和父 Job repository 使用同一 advisory key。"""
+        bind = self.session.get_bind()
+        if getattr(getattr(bind, "dialect", None), "name", None) == "postgresql":
+            self.session.execute(
+                select(func.pg_advisory_xact_lock(func.hashtext(f"mememeow:image-processing:{self.scope.scope_id}:{meme_id}:{image_sha256}")))
+            )
+
+    def _has_active_target_task(self, meme_id: UUID, image_sha256: str) -> bool:
+        """查询当前事务中已存在的同图活动阶段任务。"""
+        return self.session.scalar(
+            select(Task.id).where(
+                Task.scope_id == self.scope.scope_id,
+                Task.task_type.in_(tuple(IMAGE_PROCESSING_LANE_TYPES)),
+                Task.status.in_(("queued", "running")),
+                Task.target_meme_id == meme_id,
+                Task.target_image_sha256 == image_sha256,
+            ).limit(1)
+        ) is not None
 
     def _lock_lane(self, lane: str) -> None:
         """在当前事务中锁定整个 lane，保证跨进程槽位判断原子化。"""
@@ -546,12 +633,7 @@ class TaskRepository:
         if include_task_types:
             filters.append(Task.task_type.in_(include_task_types))
         if exclude_image_pipeline:
-            filters.append(
-                ~(
-                    Task.task_type.in_(IMAGE_PROCESSING_LANE_TYPES)
-                    & Task.submission_mode.in_(('pipeline', 'standalone'))
-                )
-            )
+            filters.append(_exclude_explicit_image_pipeline())
         rows = list(
             self.session.scalars(
                 select(Task)
@@ -983,12 +1065,7 @@ class TaskRepository:
             if exclude_task_types:
                 candidate_filters.append(~Task.task_type.in_(exclude_task_types))
             if exclude_image_pipeline:
-                candidate_filters.append(
-                    ~(
-                        Task.task_type.in_(IMAGE_PROCESSING_LANE_TYPES)
-                        & Task.submission_mode.in_(('pipeline', 'standalone'))
-                    )
-                )
+                candidate_filters.append(_exclude_explicit_image_pipeline())
             candidate_scope_ids = list(self.session.scalars(select(Task.scope_id).where(*candidate_filters).distinct()))
             if not candidate_scope_ids:
                 return None
@@ -1059,12 +1136,7 @@ class TaskRepository:
                 if exclude_task_types:
                     task_filters.append(~Task.task_type.in_(exclude_task_types))
                 if exclude_image_pipeline:
-                    task_filters.append(
-                        ~(
-                            Task.task_type.in_(IMAGE_PROCESSING_LANE_TYPES)
-                            & Task.submission_mode.in_(('pipeline', 'standalone'))
-                        )
-                    )
+                    task_filters.append(_exclude_explicit_image_pipeline())
                 task_filters.append(resource_filter)
                 task = self.session.scalar(
                     select(Task)
@@ -1533,6 +1605,7 @@ class TaskRepository:
 
     def list(self, *, statuses: set[str] | None = None, task_types: set[str] | None = None, cursor: str | None = None, limit: int = 50) -> tuple[list[Task], str | None]:
         """按创建时间和 ID 稳定分页列出当前 scope 任务。"""
+        page_limit = max(1, min(limit, 100))
         statement = select(Task).where(Task.scope_id == self.scope.scope_id)
         if statuses:
             statement = statement.where(Task.status.in_(statuses))
@@ -1542,22 +1615,24 @@ class TaskRepository:
             cursor_record = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == cursor))
             if cursor_record:
                 statement = statement.where((Task.created_at < cursor_record.created_at) | ((Task.created_at == cursor_record.created_at) & (Task.id < cursor_record.id)))
-        statement = statement.order_by(Task.created_at.desc(), Task.id.desc()).limit(max(1, min(limit, 100)) + 1)
+        statement = statement.order_by(Task.created_at.desc(), Task.id.desc()).limit(page_limit + 1)
         records = list(self.session.scalars(statement))
-        next_cursor = records[-1].id if len(records) > limit else None
-        return records[:limit], next_cursor
+        # 游标必须指向本页最后一条已返回记录；预取的下一条只用于判断是否还有后续页。
+        next_cursor = records[page_limit - 1].id if len(records) > page_limit else None
+        return records[:page_limit], next_cursor
 
     def list_for_worker(self, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Task], str | None]:
         """按更新时间和 ID 扫描排队任务，保持 Worker 发现顺序与工作台解耦。"""
+        page_limit = max(1, min(limit, 100))
         statement = select(Task).where(Task.scope_id == self.scope.scope_id, Task.status == "queued")
         if cursor:
             cursor_record = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == cursor))
             if cursor_record:
                 statement = statement.where((Task.updated_at < cursor_record.updated_at) | ((Task.updated_at == cursor_record.updated_at) & (Task.id < cursor_record.id)))
-        statement = statement.order_by(Task.updated_at.desc(), Task.id.desc()).limit(max(1, min(limit, 100)) + 1)
+        statement = statement.order_by(Task.updated_at.desc(), Task.id.desc()).limit(page_limit + 1)
         records = list(self.session.scalars(statement))
-        next_cursor = records[-1].id if len(records) > limit else None
-        return records[:limit], next_cursor
+        next_cursor = records[page_limit - 1].id if len(records) > page_limit else None
+        return records[:page_limit], next_cursor
 
 
 

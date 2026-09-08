@@ -682,11 +682,22 @@ class PersistentGrantRepository:
             )
         ):
             raise OperationPolicyError("operation_policy_unavailable")
+        # 迁移前行没有独立计量列；已验证的旧指纹仍可按默认零成本请求
+        # 读取，但内存 association 必须使用当前请求的规范指纹，才能通过
+        # GrantAssociation 的统一校验。持久行的旧指纹已经在上方完成验证。
+        association_fingerprint = request.request_fingerprint
+        metadata = {
+            "attempt_id": row.attempt_id,
+            "input_digest": row.input_digest,
+            "request_fingerprint": association_fingerprint,
+        }
+        if row.metering_units is None:
+            metadata["legacy_request_fingerprint"] = fingerprint
         return GrantAssociation(
             request,
             GrantRef(row.grant_id, row.operation, row.idempotency_key, self.scope),
             row.state,
-            {"attempt_id": row.attempt_id, "input_digest": row.input_digest, "request_fingerprint": fingerprint},
+            metadata,
         )
 
     def get(self, request: OperationRequest) -> GrantAssociation | None:

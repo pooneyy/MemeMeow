@@ -6,16 +6,44 @@
 
 from __future__ import annotations
 
+import re
 import uuid
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
-from backend.paths import SUPPORTED_EXTENSIONS, validate_business_storage_key
+from backend.image_naming import normalize_display_name, normalize_extension, saved_filename
+from backend.paths import validate_business_storage_key
 from backend.persistence.engine import DatabaseError
 from backend.persistence.models import Meme, ScopeContext, StorageOperation, Task, utcnow
+
+
+def _durable_meme_clause():
+    """构造列表和 count 共用的最终 durable Meme 过滤条件。"""
+    return and_(
+        Meme.sha256.op("~")(r"^[0-9a-f]{64}$"),
+        Meme.extension.in_((".png", ".jpg", ".jpeg", ".gif")),
+        Meme.extension == func.lower(Meme.extension),
+        Meme.storage_key != "",
+        Meme.storage_key == Meme.sha256 + Meme.extension,
+        Meme.storage_key.not_like("%/%"),
+        Meme.storage_key.not_like("%\\%", escape="!"),
+        Meme.storage_key.not_in((".", "..", ".staging", ".quarantine")),
+        Meme.display_name.is_not(None),
+        Meme.display_name != "",
+        Meme.display_name == func.btrim(Meme.display_name, " ."),
+        Meme.display_name.not_like("%/%"),
+        Meme.display_name.not_like("%\\%", escape="!"),
+        Meme.display_name.not_in((".", "..", ".staging", ".quarantine")),
+        Meme.display_name.not_like("%.png"),
+        Meme.display_name.not_like("%.jpg"),
+        Meme.display_name.not_like("%.jpeg"),
+        Meme.display_name.not_like("%.gif"),
+        Meme.display_name.op("~")(r"^[^[:cntrl:]]+$"),
+    )
 
 
 class MemeRepository:
@@ -42,27 +70,68 @@ class MemeRepository:
             statement = statement.with_for_update()
         return self.session.scalar(statement)
 
+    def by_content(self, sha256: str, extension: str, *, for_update: bool = False) -> Meme | None:
+        """按当前 scope 的最终图片 SHA 和扩展名查询唯一 Meme。"""
+        if not isinstance(sha256, str) or re.fullmatch(r"[0-9a-fA-F]{64}", sha256) is None:
+            raise DatabaseError("sha256_invalid")
+        try:
+            normalized_extension = normalize_extension(extension)
+        except ValueError as exc:
+            raise DatabaseError(str(exc)) from exc
+        statement = select(Meme).where(
+            Meme.scope_id == self.scope.scope_id,
+            Meme.sha256 == sha256.lower(),
+            Meme.extension == normalized_extension,
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return self.session.scalar(statement)
+
+    def find_by_content(self, sha256: str, extension: str, *, for_update: bool = False) -> Meme | None:
+        """返回 `by_content` 的语义别名，供上传和合集导入统一调用。"""
+        return self.by_content(sha256, extension, for_update=for_update)
+
     def list(self, *, search: str | None = None, page: int = 1, page_size: int = 200) -> list[Meme]:
-        """在数据库内按文件名筛选、分页并稳定排序当前 scope 的 Meme。"""
+        """在数据库内按展示名称筛选、分页并稳定排序当前 scope 的 durable Meme。"""
         statement = select(Meme).where(*self._visible_predicate())
         if search:
-            statement = statement.where(Meme.storage_key.ilike(f"%{search}%"))
-        statement = statement.order_by(Meme.storage_key.asc(), Meme.id.asc()).offset(max(0, page - 1) * page_size).limit(max(1, min(page_size, 200)))
+            statement = statement.where(Meme.display_name.ilike(f"%{search}%"))
+        statement = statement.order_by(Meme.display_name.asc(), Meme.id.asc()).offset(max(0, page - 1) * page_size).limit(max(1, min(page_size, 200)))
         return list(self.session.scalars(statement))
 
     def count(self, *, search: str | None = None) -> int:
         """返回当前 scope 的可见 Meme 数量，筛选在数据库执行。"""
         statement = select(func.count()).select_from(Meme).where(*self._visible_predicate())
         if search:
-            statement = statement.where(Meme.storage_key.ilike(f"%{search}%"))
+            statement = statement.where(Meme.display_name.ilike(f"%{search}%"))
         return int(self.session.scalar(statement) or 0)
 
     def list_all(self, *, search: str | None = None) -> list[Meme]:
         """供缓存生成等内部批处理读取当前 scope 全量 Meme；公共列表仍使用分页。"""
         statement = select(Meme).where(*self._visible_predicate())
         if search:
-            statement = statement.where(Meme.storage_key.ilike(f"%{search}%"))
-        return list(self.session.scalars(statement.order_by(Meme.storage_key.asc(), Meme.id.asc())))
+            statement = statement.where(Meme.display_name.ilike(f"%{search}%"))
+        return list(self.session.scalars(statement.order_by(Meme.display_name.asc(), Meme.id.asc())))
+
+    def list_rebuild_page(self, *, after_id: UUID | None = None, limit: int = 200) -> list[Meme]:
+        """按稳定 UUID keyset 读取检索重建的一页 Meme。
+
+        输入是上一次返回的最后一个 UUID 和有界页大小，输出只包含当前 scope 的
+        结构合法、状态允许索引的数据库行。调用场景是离线检索向量重建；它不
+        读取文件，也不把整个 scope 装入单次查询结果。
+        """
+        try:
+            normalized_limit = max(1, min(int(limit), 500))
+        except (TypeError, ValueError) as exc:
+            raise DatabaseError("migration_count_invalid") from exc
+        statement = select(Meme).where(
+            Meme.scope_id == self.scope.scope_id,
+            Meme.context_status.in_(("partial", "ready")),
+            _durable_meme_clause(),
+        )
+        if after_id is not None:
+            statement = statement.where(Meme.id > after_id)
+        return list(self.session.scalars(statement.order_by(Meme.id.asc()).limit(normalized_limit)))
 
     def _visible_predicate(self) -> tuple[Any, ...]:
         """返回列表与 count 共用的结构可见性条件。
@@ -74,26 +143,32 @@ class MemeRepository:
             StorageOperation.meme_id == Meme.id,
             StorageOperation.status.in_(("prepared", "file_applied")),
         ).exists()
-        return (
-            Meme.scope_id == self.scope.scope_id,
-            ~active_operation,
-            Meme.storage_key != "",
-            ~Meme.storage_key.in_((".", "..", ".staging", ".quarantine")),
-            ~Meme.storage_key.contains("/"),
-            ~Meme.storage_key.contains("\\"),
-            Meme.extension.in_(tuple(SUPPORTED_EXTENSIONS)),
-        )
+        return (Meme.scope_id == self.scope.scope_id, ~active_operation, _durable_meme_clause())
 
-    def create(self, *, storage_key: str, extension: str, size_bytes: int, sha256: str, context: dict[str, Any], provenance: dict[str, Any], status: str = "pending", meme_id: UUID | None = None, extensions: dict[str, Any] | None = None) -> Meme:
-        """创建稳定 UUID Meme 和初始语境记录。"""
+    def create(self, *, storage_key: str, extension: str, size_bytes: int, sha256: str, context: dict[str, Any], provenance: dict[str, Any], display_name: str | None = None, status: str = "pending", meme_id: UUID | None = None, extensions: dict[str, Any] | None = None) -> Meme:
+        """创建稳定 UUID Meme、独立展示名称和初始语境记录。"""
         try:
             validate_business_storage_key(storage_key)
         except ValueError as exc:
             raise DatabaseError(str(exc)) from exc
+        try:
+            normalized_extension = normalize_extension(extension)
+            if Path(storage_key).suffix.lower() != normalized_extension:
+                raise ValueError("extension_storage_key_mismatch")
+            normalized_name = normalize_display_name(display_name if display_name is not None else Path(storage_key).stem)
+        except ValueError as exc:
+            raise DatabaseError(str(exc)) from exc
+        if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
+            raise DatabaseError("size_bytes_invalid")
+        if not isinstance(sha256, str) or re.fullmatch(r"[0-9a-fA-F]{64}", sha256) is None:
+            raise DatabaseError("sha256_invalid")
+        normalized_sha256 = sha256.lower()
+        if storage_key != f"{normalized_sha256}{normalized_extension}":
+            raise DatabaseError("content_addressed_key_required")
         from backend.metadata import MemeContext, semantic_document_hash
 
         parsed_context = MemeContext.model_validate(context)
-        record = Meme(id=meme_id or uuid.uuid4(), scope_id=self.scope.scope_id, storage_key=storage_key, extension=extension.lower(), size_bytes=size_bytes, sha256=sha256, context_status=status, search_metadata_hash=semantic_document_hash(parsed_context), meme_context=parsed_context.model_dump(mode="json", exclude_none=False), provenance=provenance, extensions=extensions or {}, revision=1)
+        record = Meme(id=meme_id or uuid.uuid4(), scope_id=self.scope.scope_id, storage_key=storage_key, display_name=normalized_name, extension=normalized_extension, size_bytes=size_bytes, sha256=normalized_sha256, context_status=status, search_metadata_hash=semantic_document_hash(parsed_context), meme_context=parsed_context.model_dump(mode="json", exclude_none=False), provenance=provenance, extensions=extensions or {}, revision=1)
         self.session.add(record)
         self.session.flush()
         return record
@@ -116,31 +191,57 @@ class MemeRepository:
         from backend.metadata import MemeContext, semantic_document_hash
 
         parsed_context = MemeContext.model_validate(context)
-        record.meme_context = parsed_context.model_dump(mode="json", exclude_none=False)
+        normalized_context = parsed_context.model_dump(mode="json", exclude_none=False)
+        context_changed = record.meme_context != normalized_context or record.context_status != status
+        record.meme_context = normalized_context
         record.search_metadata_hash = semantic_document_hash(parsed_context)
         record.provenance = provenance
         record.context_status = status
-        record.revision += 1
+        if context_changed:
+            record.revision += 1
         record.updated_at = utcnow()
         self.session.flush()
         return record
 
-    def rename(self, meme_id: UUID | str, storage_key: str) -> Meme:
-        """按稳定 Meme ID 更新扁平 storage_key，确保身份和 revision 保持。"""
+    def update_display_name(
+        self,
+        meme_id: UUID | str,
+        display_name: str,
+        *,
+        expected_display_name: str | None = None,
+        expected_revision: int | None = None,
+        expected_sha256: str | None = None,
+        claim: tuple[str, int, str] | None = None,
+    ) -> Meme:
+        """以可选 CAS/Task claim 只更新展示名称，不触碰物理身份或 revision。"""
         try:
-            validate_business_storage_key(storage_key)
+            normalized_name = normalize_display_name(display_name)
         except ValueError as exc:
             raise DatabaseError(str(exc)) from exc
         record = self.get(meme_id, for_update=True)
         if record is None:
             raise DatabaseError("meme_not_found")
-        if self.by_storage_key(storage_key) and record.storage_key != storage_key:
-            raise DatabaseError("target_exists")
-        record.storage_key = storage_key
-        record.revision += 1
+        if claim is not None:
+            task_id, claim_generation, owner = claim
+            now = utcnow()
+            task = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id).with_for_update())
+            if task is None or task.status != "running" or task.claim_generation != claim_generation or task.lease_owner != owner or task.lease_expires_at is None or task.lease_expires_at <= now:
+                raise DatabaseError("claim_expired")
+        if expected_display_name is not None and record.display_name != expected_display_name:
+            raise DatabaseError("target_changed")
+        if expected_revision is not None and record.revision != expected_revision:
+            raise DatabaseError("target_changed")
+        if expected_sha256 is not None and record.sha256.lower() != expected_sha256.lower():
+            raise DatabaseError("target_changed")
+        record.display_name = normalized_name
         record.updated_at = utcnow()
         self.session.flush()
         return record
+
+    @staticmethod
+    def saved_filename(record: Meme) -> str:
+        """返回 Meme 的完整用户文件名，不使用物理 storage key。"""
+        return saved_filename(record.display_name, record.extension)
 
     def delete(self, meme_id: UUID | str) -> Meme:
         """删除当前 scope 的 Meme 记录；调用方负责先完成文件隔离。"""

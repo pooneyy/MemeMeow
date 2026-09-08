@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
 from typing import Any, Callable, Mapping
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from backend.persistence.models import (
     EMBEDDING_DIMENSIONS,
@@ -39,9 +39,14 @@ logger = logging.getLogger("backend.pg_services")
 
 def _generic_task_filter() -> Any:
     """返回通用 Worker 可处理的任务条件，保留迁移前图片任务。"""
-    return ~(
-        Task.task_type.in_(IMAGE_PROCESSING_TASK_TYPES)
-        & Task.submission_mode.in_(("pipeline", "standalone"))
+    # submission_mode 允许为 NULL 以兼容迁移前任务；直接对组合条件取反会让
+    # SQL 的三值逻辑把这些历史行错误地过滤掉。
+    return or_(
+        Task.submission_mode.is_(None),
+        ~(
+            Task.task_type.in_(IMAGE_PROCESSING_TASK_TYPES)
+            & Task.submission_mode.in_(("pipeline", "standalone"))
+        ),
     )
 
 class PostgresTaskWorkerManager:

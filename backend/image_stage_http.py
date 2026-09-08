@@ -13,10 +13,11 @@ from typing import Any
 from fastapi import HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
+from backend.image_naming import public_filename_fields
 from backend.image_processing import ImageProcessingError, ImageProcessingWorker
 from backend.metadata import MetadataError
 from backend.operation_policy import OperationPolicyError
-from backend.public_dto import normalize_public_filename, normalize_public_identifier
+from backend.public_dto import normalize_public_identifier
 
 
 class _StrictRequestModel(BaseModel):
@@ -79,16 +80,13 @@ def _job_snapshot_payload(request: Request, snapshot: Any, *, service: Service) 
         return data
     image_data: dict[str, object] = {"meme_id": meme_id}
     try:
-        meme_record, image = service(request, "metadata").image_for_meme(meme_id)
+        meme_record, _image = service(request, "metadata").image_for_meme(meme_id)
         image_data["media_url"] = f"/media/{meme_id}"
-        display_name = normalize_public_filename(getattr(meme_record, "display_name", None))
-        extension = getattr(meme_record, "extension", None)
-        saved_filename = normalize_public_filename(f"{display_name}{extension}") if display_name and isinstance(extension, str) else None
-        filename = saved_filename or normalize_public_filename(getattr(image, "name", None))
-        if filename:
-            image_data.update({"filename": filename, "saved_filename": filename})
-        if display_name:
-            image_data["display_name"] = display_name
+        try:
+            image_data.update(public_filename_fields(meme_record))
+        except ValueError:
+            # 内容寻址 key 只属于内部控制面；展示字段损坏时保持关联而省略文件名。
+            pass
     except MetadataError:
         pass
     data["image"] = image_data

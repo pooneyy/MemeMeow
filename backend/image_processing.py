@@ -19,7 +19,7 @@ from datetime import timedelta
 from typing import Any, Callable, Iterable, Mapping
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import and_, func, or_, select, text, tuple_, update
 
 from backend.database import (
     DatabaseError,
@@ -36,14 +36,18 @@ from backend.database import (
     utcnow,
 )
 from backend.config import validate_agent_concurrency
+from backend.image_naming import content_addressed_key, normalize_extension
 from backend.image_stage_plan import (
     IMAGE_STAGE_ORDER,
+    PROCESSING_MODES,
     SETTLED_STAGE_STATUSES,
     STAGE_TASK_TYPES,
     ImageStagePlan,
+    build_stage_plan,
     normalize_stage,
+    normalize_processing_mode,
 )
-from backend.metadata import MemeContext, semantic_document_hash
+from backend.metadata import MemeContext, semantic_document, semantic_document_hash
 from backend.agent_resume import normalize_identifier
 from backend.operation_policy import (
     GrantAssociation,
@@ -117,10 +121,26 @@ def image_file_matches(resources: Any, scope_id: ScopeContext | str, meme: Meme,
     只是声明事实，不能替代对文件系统当前字节的验证。
     """
     try:
+        if (
+            not isinstance(meme.sha256, str)
+            or len(meme.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in meme.sha256)
+            or type(meme.size_bytes) is not int
+            or meme.size_bytes < 0
+            or not isinstance(meme.extension, str)
+            or not isinstance(meme.storage_key, str)
+        ):
+            return False
+        extension = normalize_extension(meme.extension)
+        if meme.extension != extension or meme.storage_key != content_addressed_key(meme.sha256, extension):
+            return False
         if blob_store is None:
             resolver = getattr(resources, "blob_store_for_scope", None)
             blob_store = resolver(scope_id) if callable(resolver) else getattr(resources, "blob_store", None)
         if blob_store is None:
+            return False
+        path = blob_store.resolve(meme.storage_key, must_exist=True)
+        if path.name != meme.storage_key or path.suffix != extension:
             return False
         return bool(
             blob_store.exists_with_identity(
@@ -190,6 +210,7 @@ class ImageProcessingSnapshot:
     updated_at: object | None = None
     completed_at: object | None = None
     auto_name: bool = False
+    processing_mode: str = "normal"
     has_warnings: bool = False
     warnings: tuple[dict[str, object], ...] = ()
 
@@ -201,6 +222,7 @@ class ImageProcessingSnapshot:
         image_sha256 = normalize_public_digest(self.image_sha256)
         reverse_image_policy = self.reverse_image_policy if isinstance(self.reverse_image_policy, str) and self.reverse_image_policy in {"forbid", "auto"} else "forbid"
         status = self.status if isinstance(self.status, str) and self.status in PUBLIC_TASK_STATUSES else "failed"
+        processing_mode = self.processing_mode if isinstance(self.processing_mode, str) and self.processing_mode in PROCESSING_MODES else "normal"
         current_stage = self.current_stage if isinstance(self.current_stage, str) and self.current_stage in PUBLIC_STAGE_NAMES else None
         progress = self.progress if isinstance(self.progress, (int, float)) and not isinstance(self.progress, bool) and 0 <= self.progress <= 1 else None
         stages = [public_processing_stage(item, job_id=job_id) for item in self.stages if isinstance(item, Mapping)]
@@ -219,6 +241,7 @@ class ImageProcessingSnapshot:
             "image_sha256": image_sha256,
             "reverse_image_policy": reverse_image_policy,
             "auto_name": self.auto_name if isinstance(self.auto_name, bool) else False,
+            "processing_mode": processing_mode,
             "status": status,
             "has_warnings": bool(warnings) or self.has_warnings is True,
             "warnings": warnings,
@@ -256,13 +279,51 @@ class ImageProcessingRepository:
     def _stages(self, session: Any, job_id: UUID) -> list[ImageProcessingStage]:
         """读取固定阶段顺序。"""
         rows = list(session.scalars(select(ImageProcessingStage).where(ImageProcessingStage.scope_id == self.scope.scope_id, ImageProcessingStage.job_id == job_id)))
+        return self._sort_stages(rows)
+
+    @staticmethod
+    def _sort_stages(rows: Iterable[ImageProcessingStage]) -> list[ImageProcessingStage]:
+        """按公开阶段计划排序已经读取的阶段行。"""
         order = {name: index for index, name in enumerate(STAGES)}
         return sorted(rows, key=lambda row: order.get(row.stage, len(STAGES)))
 
-    def create_or_reuse(self, meme_id: UUID | str, image_sha256: str, *, metadata_hash: str | None = None, config: Mapping[str, object] | None = None, reverse_image_policy: object = None, auto_name: object = None, explicit_retry: bool = False) -> ImageProcessingJob:
-        """创建或复用逐图 job；活动选项冲突会 fail-closed。"""
+    def _attempts(self, session: Any, task_ids: Iterable[str]) -> dict[tuple[str, int], ImageProcessingAttempt]:
+        """批量读取阶段关联 Task 的 attempt，并按 Task/attempt 建立映射。"""
+        normalized = tuple(dict.fromkeys(task_id for task_id in task_ids if isinstance(task_id, str) and task_id))
+        if not normalized:
+            return {}
+        return {
+            (attempt.task_id, attempt.attempt): attempt
+            for attempt in session.scalars(
+                select(ImageProcessingAttempt).where(
+                    ImageProcessingAttempt.scope_id == self.scope.scope_id,
+                    ImageProcessingAttempt.task_id.in_(normalized),
+                )
+            )
+        }
+
+    def create_or_reuse(
+        self,
+        meme_id: UUID | str,
+        image_sha256: str,
+        *,
+        metadata_hash: str | None = None,
+        config: Mapping[str, object] | None = None,
+        reverse_image_policy: object = None,
+        auto_name: object = None,
+        processing_mode: str = "normal",
+        explicit_retry: bool = False,
+    ) -> ImageProcessingJob:
+        """按创建时固定的处理方式建立 Job；普通处理可幂等观察同选项活动 Job。"""
         policy = normalize_reverse_image_policy(reverse_image_policy)
         auto_name_value = normalize_auto_name(auto_name)
+        if explicit_retry and processing_mode == "normal":
+            # 旧 HTTP 字段只在边界转换一次；后续计划只看明确模式。
+            processing_mode = "full_retry"
+        try:
+            processing_mode = normalize_processing_mode(processing_mode)
+        except ValueError as exc:
+            raise ImageProcessingError("invalid_processing_mode") from exc
         config_hash = processing_config_hash(config)
         meme_uuid = UUID(str(meme_id))
         if len(image_sha256) != 64 or any(char not in "0123456789abcdefABCDEF" for char in image_sha256):
@@ -289,18 +350,32 @@ class ImageProcessingRepository:
             rows = list(session.scalars(select(ImageProcessingJob).where(ImageProcessingJob.scope_id == self.scope.scope_id, ImageProcessingJob.meme_id == meme_uuid, ImageProcessingJob.image_sha256 == image_sha256).order_by(ImageProcessingJob.revision.desc(), ImageProcessingJob.created_at.desc()).with_for_update()))
             active = next((row for row in rows if row.status in ACTIVE_JOB_STATUSES), None)
             if active is not None:
-                # 既有策略契约优先于新增自动命名选项：两者同时冲突时仍返回
-                # generation_policy_conflict，只有策略/配置一致且 auto_name 单独
-                # 不一致时才使用更具体的 processing_options_conflict。
-                if active.processing_config_hash != config_hash or active.reverse_image_policy != policy or active.metadata_hash != metadata_hash:
-                    raise ImageProcessingError("generation_policy_conflict")
-                if bool(getattr(active, "auto_name", False)) != auto_name_value:
-                    raise ImageProcessingError("processing_options_conflict")
-                session.commit()
-                return active
+                if processing_mode == "normal" and not explicit_retry:
+                    # 普通首次处理保留旧的幂等语义：相同冻结选项直接观察已有
+                    # Job；只有显式重试或修复才把活动父 Job 视为图片级冲突。
+                    if active.processing_config_hash != config_hash or active.reverse_image_policy != policy or active.metadata_hash != metadata_hash:
+                        raise ImageProcessingError("generation_policy_conflict")
+                    if bool(getattr(active, "auto_name", False)) != auto_name_value:
+                        raise ImageProcessingError("processing_options_conflict")
+                    session.commit()
+                    return active
+                raise ImageProcessingError("image_processing_active")
+            if self._has_active_image_task(session, meme_uuid, image_sha256):
+                raise ImageProcessingError("image_processing_active")
             latest = rows[0] if rows else None
+            readiness = self._readiness_from_job(
+                session,
+                latest,
+                config=config,
+                reverse_image_policy=policy,
+                metadata_hash=metadata_hash,
+            )
+            stage_plan = build_stage_plan(processing_mode, auto_name=auto_name_value, readiness=readiness)
+            if processing_mode == "repair" and not any(planned for planned, _reason in stage_plan.values()):
+                raise ImageProcessingError("already_ready")
             can_check_latest = (
                 latest is not None
+                and processing_mode == "normal"
                 and not explicit_retry
                 and latest.processing_config_hash == config_hash
                 and latest.reverse_image_policy == policy
@@ -323,6 +398,8 @@ class ImageProcessingRepository:
                     config_hash=config_hash,
                     policy=policy,
                     auto_name_value=auto_name_value,
+                    processing_mode=processing_mode,
+                    stage_plan=stage_plan,
                     latest=latest,
                 )
                 session.commit()
@@ -364,16 +441,31 @@ class ImageProcessingRepository:
             )
             active = next((row for row in rows if row.status in ACTIVE_JOB_STATUSES), None)
             if active is not None:
-                if active.processing_config_hash != config_hash or active.reverse_image_policy != policy or active.metadata_hash != metadata_hash:
-                    raise ImageProcessingError("generation_policy_conflict")
-                if bool(getattr(active, "auto_name", False)) != auto_name_value:
-                    raise ImageProcessingError("processing_options_conflict")
-                session.commit()
-                return active
+                if processing_mode == "normal" and not explicit_retry:
+                    if active.processing_config_hash != config_hash or active.reverse_image_policy != policy or active.metadata_hash != metadata_hash:
+                        raise ImageProcessingError("generation_policy_conflict")
+                    if bool(getattr(active, "auto_name", False)) != auto_name_value:
+                        raise ImageProcessingError("processing_options_conflict")
+                    session.commit()
+                    return active
+                raise ImageProcessingError("image_processing_active")
+            if self._has_active_image_task(session, meme_uuid, image_sha256):
+                raise ImageProcessingError("image_processing_active")
             latest = rows[0] if rows else None
+            readiness = self._readiness_from_job(
+                session,
+                latest,
+                config=config,
+                reverse_image_policy=policy,
+                metadata_hash=metadata_hash,
+            )
+            stage_plan = build_stage_plan(processing_mode, auto_name=auto_name_value, readiness=readiness)
+            if processing_mode == "repair" and not any(planned for planned, _reason in stage_plan.values()):
+                raise ImageProcessingError("already_ready")
             same_candidate = (
                 latest is not None
                 and candidate_job_id is not None
+                and processing_mode == "normal"
                 and latest.id == candidate_job_id
                 and latest.processing_config_hash == config_hash
                 and latest.reverse_image_policy == policy
@@ -386,6 +478,10 @@ class ImageProcessingRepository:
             if same_candidate and self._core_ready(session, latest):
                 session.commit()
                 return latest
+            if processing_mode == "normal" and not any(planned for planned, _reason in stage_plan.values()):
+                # 阶段历史看似成功但底层产物或图片身份已失效时，普通处理不能
+                # 创建一个“全跳过”的空 Job；重新建立完整启用计划。
+                stage_plan = build_stage_plan("full_retry", auto_name=auto_name_value, readiness=readiness)
             job = self._new_queued_job(
                 session,
                 meme_uuid=meme_uuid,
@@ -395,10 +491,102 @@ class ImageProcessingRepository:
                 config_hash=config_hash,
                 policy=policy,
                 auto_name_value=auto_name_value,
+                processing_mode=processing_mode,
+                stage_plan=stage_plan,
                 latest=latest,
             )
             session.commit()
             return job
+
+    def create_queued_in_session(
+        self,
+        session: Any,
+        meme_id: UUID | str,
+        image_sha256: str,
+        *,
+        metadata_hash: str | None = None,
+        config: Mapping[str, object] | None = None,
+        reverse_image_policy: object = None,
+        auto_name: object = None,
+        processing_mode: str = "normal",
+        explicit_retry: bool = False,
+    ) -> ImageProcessingJob:
+        """在调用方持有的短事务中锁图、检查活动执行并创建固定 Job。
+
+        该入口用于用户发起的完整重试和修复。调用方必须在事务退出前提交；本方法
+        不读取文件、不申请 grant，也不调度 Worker，从而让 Job 与同图活动 Task 的
+        检查和创建共享同一图片 advisory transaction lock。
+        """
+        policy = normalize_reverse_image_policy(reverse_image_policy)
+        auto_name_value = normalize_auto_name(auto_name)
+        if explicit_retry and processing_mode == "normal":
+            processing_mode = "full_retry"
+        try:
+            processing_mode = normalize_processing_mode(processing_mode)
+        except ValueError as exc:
+            raise ImageProcessingError("invalid_processing_mode") from exc
+        config_hash = processing_config_hash(config)
+        try:
+            meme_uuid = UUID(str(meme_id))
+        except (TypeError, ValueError) as exc:
+            raise ImageProcessingError("target_changed") from exc
+        if not isinstance(image_sha256, str) or len(image_sha256) != 64 or any(char not in "0123456789abcdefABCDEF" for char in image_sha256):
+            raise ImageProcessingError("target_changed")
+        if metadata_hash is not None and (len(metadata_hash) != 64 or any(char not in "0123456789abcdefABCDEF" for char in metadata_hash)):
+            raise ImageProcessingError("target_changed")
+        image_sha256 = image_sha256.lower()
+
+        self._lock_image_revision(session, meme_uuid, image_sha256)
+        meme = session.scalar(
+            select(Meme).where(
+                Meme.scope_id == self.scope.scope_id,
+                Meme.id == meme_uuid,
+            )
+        )
+        if meme is None or str(meme.sha256).lower() != image_sha256:
+            raise ImageProcessingError("target_changed")
+        rows = list(
+            session.scalars(
+                select(ImageProcessingJob)
+                .where(
+                    ImageProcessingJob.scope_id == self.scope.scope_id,
+                    ImageProcessingJob.meme_id == meme_uuid,
+                    ImageProcessingJob.image_sha256 == image_sha256,
+                )
+                .order_by(ImageProcessingJob.revision.desc(), ImageProcessingJob.created_at.desc())
+                .with_for_update()
+            )
+        )
+        if next((row for row in rows if row.status in ACTIVE_JOB_STATUSES), None) is not None:
+            raise ImageProcessingError("image_processing_active")
+        if self._has_active_image_task(session, meme_uuid, image_sha256):
+            raise ImageProcessingError("image_processing_active")
+        latest = rows[0] if rows else None
+        readiness = self._readiness_from_job(
+            session,
+            latest,
+            config=config,
+            reverse_image_policy=policy,
+            metadata_hash=metadata_hash,
+        )
+        stage_plan = build_stage_plan(processing_mode, auto_name=auto_name_value, readiness=readiness)
+        if processing_mode == "repair" and not any(planned for planned, _reason in stage_plan.values()):
+            raise ImageProcessingError("already_ready")
+        if processing_mode == "normal" and not any(planned for planned, _reason in stage_plan.values()):
+            stage_plan = build_stage_plan("full_retry", auto_name=auto_name_value, readiness=readiness)
+        return self._new_queued_job(
+            session,
+            meme_uuid=meme_uuid,
+            image_sha256=image_sha256,
+            metadata_hash=metadata_hash,
+            config=config,
+            config_hash=config_hash,
+            policy=policy,
+            auto_name_value=auto_name_value,
+            processing_mode=processing_mode,
+            stage_plan=stage_plan,
+            latest=latest,
+        )
 
     def _core_ready(self, session: Any, job: ImageProcessingJob, *, blob_store: Any | None = None) -> bool:
         """只在数据库事务内验证成功 Job 的阶段和产物绑定关系。
@@ -412,21 +600,26 @@ class ImageProcessingRepository:
             meme = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == job.meme_id))
             if meme is None or meme.sha256.lower() != job.image_sha256.lower():
                 return False
-            stage_statuses = {item.stage: item.status for item in self._stages(session, job.id)}
-            if any(stage_statuses.get(stage) != "succeeded" for stage in ("visual", "agent", "text_embedding")):
-                return False
+            stage_rows = {item.stage: item for item in self._stages(session, job.id)}
+            for stage in ("visual", "agent", "text_embedding"):
+                row = stage_rows.get(stage)
+                if row is None or row.status == "succeeded":
+                    continue
+                if row.status != "skipped" or getattr(row, "skip_reason", None) != "already_ready":
+                    return False
             # 新 Job 的自动重命名可以跳过或以 warning 收束；其它非收束状态
             # 说明控制面尚未证明该 revision 可复用，不能只看三个核心阶段。
-            auto_rename_stage = next(
-                (item for item in self._stages(session, job.id) if item.stage == "auto_rename"),
-                None,
-            )
+            auto_rename_stage = stage_rows.get("auto_rename")
             auto_rename_status = auto_rename_stage.status if auto_rename_stage is not None else "skipped"
             if auto_rename_status not in STAGE_SETTLED:
                 return False
             if auto_rename_status == "warning":
                 warning_code = (auto_rename_stage.error or {}).get("error") if isinstance(auto_rename_stage.error, Mapping) else None
                 if warning_code not in AUTO_RENAME_WARNING_ERRORS:
+                    return False
+                if bool(getattr(job, "auto_name", False)):
+                    # 本次请求明确启用了自动命名时，warning 仍属于未就绪，
+                    # 不能把旧 Job 当作普通处理已完成直接复用。
                     return False
             config = dict(job.processing_config or {})
             visual = session.scalar(
@@ -486,6 +679,84 @@ class ImageProcessingRepository:
                 {"key": f"mememeow:image-processing:{self.scope.scope_id}:{meme_uuid}:{image_sha256}"},
             )
 
+    def _has_active_image_task(self, session: Any, meme_uuid: UUID, image_sha256: str) -> bool:
+        """查询当前图片的活动父 Job 叶子或独立阶段任务。
+
+        新任务优先使用结构化目标列；迁移前仍可可靠从受校验 payload 读取的历史
+        任务也纳入门禁，无法归类的活动历史由 migration 阻止入口启用。
+        """
+        # 结构化列命中时使用活动目标索引；只有迁移前尚未补齐列的历史行才回退到
+        # JSON payload，避免每次提交都把当前 scope 的全部活动任务拉进进程。
+        target_match = and_(
+            Task.target_meme_id == meme_uuid,
+            Task.target_image_sha256 == image_sha256.lower(),
+        )
+        legacy_match = and_(
+            Task.target_meme_id.is_(None),
+            Task.target_image_sha256.is_(None),
+            Task.payload["meme_id"].as_string() == str(meme_uuid),
+            func.lower(Task.payload["image_sha256"].as_string()) == image_sha256.lower(),
+        )
+        active_task_id = session.scalar(
+            select(Task.id)
+            .where(
+                Task.scope_id == self.scope.scope_id,
+                Task.task_type.in_(tuple(STAGE_TASK_TYPES.values())),
+                Task.status.in_(tuple(ACTIVE_JOB_STATUSES)),
+                or_(target_match, legacy_match),
+            )
+            .limit(1)
+        )
+        # 兼容旧的轻量测试 Session：真实 Task.id 是字符串；其它 ORM/fake 对象
+        # 不能被误判为命中的活动任务。
+        return isinstance(active_task_id, (str, UUID))
+
+    @staticmethod
+    def _readiness_from_job(
+        session: Any,
+        job: ImageProcessingJob | None,
+        *,
+        config: Mapping[str, object] | None = None,
+        reverse_image_policy: str | None = None,
+        metadata_hash: str | None = None,
+    ) -> dict[str, bool]:
+        """按当前提交选项和最近 Job 阶段事实构造创建时的就绪快照。
+
+        Job 阶段状态只能说明上一轮执行是否收束；当前配置、联网策略或语境指纹
+        变化时，旧状态不能继续作为修复计划的跳过依据。这里仅读取数据库事实，
+        文件和模型等耗时校验仍由事务外的调用方负责。
+        """
+        if job is None:
+            return {stage: False for stage in STAGES}
+        rows = session.scalars(
+            select(ImageProcessingStage).where(
+                ImageProcessingStage.scope_id == getattr(job, "scope_id", None),
+                ImageProcessingStage.job_id == job.id,
+            )
+        )
+        readiness = {stage: False for stage in STAGES}
+        for row in rows:
+            # warning 明确表示自动命名仍未就绪；skipped 只表示本次未执行，不能
+            # 伪装成当前图片产物已经可用。
+            stage = getattr(row, "stage", None)
+            if stage in readiness:
+                status = getattr(row, "status", None)
+                readiness[stage] = status == "succeeded" or (
+                    status == "skipped" and getattr(row, "skip_reason", None) == "already_ready"
+                )
+        if config is not None and processing_config_hash(config) != getattr(job, "processing_config_hash", None):
+            # 配置哈希包含视觉、Agent 和文本向量的输入；无法证明其中哪一项仍然
+            # 对应当前配置时，保守地让三个核心阶段重新建立结果。
+            for stage in ("visual", "agent", "text_embedding"):
+                readiness[stage] = False
+        if reverse_image_policy is not None and getattr(job, "reverse_image_policy", None) != reverse_image_policy:
+            # 联网策略只影响 Agent 语境及其派生文本索引，不影响视觉向量。
+            readiness["agent"] = False
+            readiness["text_embedding"] = False
+        if metadata_hash is None or getattr(job, "metadata_hash", None) != metadata_hash:
+            readiness["text_embedding"] = False
+        return readiness
+
     def _new_queued_job(
         self,
         session: Any,
@@ -497,6 +768,8 @@ class ImageProcessingRepository:
         config_hash: str,
         policy: str,
         auto_name_value: bool,
+        processing_mode: str,
+        stage_plan: Mapping[str, tuple[bool, str | None]],
         latest: ImageProcessingJob | None,
     ) -> ImageProcessingJob:
         """在当前短事务中创建 queued Job 及其固定阶段行。"""
@@ -511,21 +784,127 @@ class ImageProcessingRepository:
             processing_config=dict(config or {}),
             reverse_image_policy=policy,
             auto_name=auto_name_value,
+            processing_mode=processing_mode,
             status="queued",
-            current_stage="visual",
+            current_stage=next((stage for stage in STAGES if stage_plan.get(stage, (False, None))[0]), None),
         )
         session.add(job)
         session.flush()
         for stage in STAGES:
+            planned, skip_reason = stage_plan.get(stage, (False, "already_ready"))
             session.add(
                 ImageProcessingStage(
                     scope_id=self.scope.scope_id,
                     job_id=job.id,
                     stage=stage,
-                    status="skipped" if stage == "auto_rename" and not auto_name_value else "queued",
+                    status="queued" if planned else "skipped",
+                    planned=planned,
+                    skip_reason=skip_reason,
                 )
             )
         return job
+
+    def _project_snapshot(self, job: ImageProcessingJob, stages: list[ImageProcessingStage], attempts: Mapping[tuple[str, int], ImageProcessingAttempt]) -> ImageProcessingSnapshot:
+        """将已批量读取的 Job、stages、attempts 投影为公开快照。"""
+        stage_names = {item.stage for item in stages if isinstance(item.stage, str)}
+        auto_name = bool(getattr(job, "auto_name", False))
+        # 旧三阶段历史只读合成跳过阶段，不写回数据库。
+        if "auto_rename" not in stage_names:
+            synthetic = ImageProcessingStage(scope_id=self.scope.scope_id, job_id=job.id, stage="auto_rename", status="skipped", planned=False, skip_reason="disabled")
+            stage_order = {name: index for index, name in enumerate(STAGES)}
+            stages = sorted(
+                [*stages, synthetic],
+                key=lambda row: stage_order.get(row.stage, len(STAGES)) if isinstance(row.stage, str) else len(STAGES),
+            )
+        completed_stages = sum(isinstance(item.status, str) and item.status in STAGE_SETTLED for item in stages)
+        progress = completed_stages / len(STAGES) if stages else None
+        message = None
+        if job.error and isinstance(job.error, Mapping):
+            message = str(job.error.get("message") or job.error.get("error") or "图片处理失败")
+        elif job.current_stage:
+            message = f"阶段：{job.current_stage}"
+        stage_payload_items: list[dict[str, object]] = []
+        for item in stages:
+            attempt = attempts.get((item.task_id, item.attempt_count)) if item.task_id else None
+            attempt_session_id = normalize_identifier(attempt.session_id, kind="session") if attempt else None
+            attempt_executor_id = normalize_identifier(attempt.executor_attempt_id, kind="attempt") if attempt else None
+            attempt_resume_available = bool(attempt and attempt.resume_available and attempt_session_id and attempt_executor_id)
+            attempt_resume_reason = attempt.resume_reason if attempt else None
+            if attempt and attempt.resume_available and not attempt_resume_available:
+                # 旧 attempt 的恢复标识损坏时，阶段详情也必须保持不可续跑。
+                attempt_resume_reason = "session_not_resumable"
+            stage_payload_items.append(
+                {
+                    "stage": item.stage,
+                    "status": item.status,
+                    "planned": bool(getattr(item, "planned", item.status != "skipped")),
+                    "skip_reason": getattr(item, "skip_reason", None) or ("disabled" if item.status == "skipped" else None),
+                    "task_id": item.task_id,
+                    "attempt": item.attempt_count,
+                    "error": item.error,
+                    "retry_at": item.retry_at,
+                    # 这些字段来自服务端 attempt 事实，前端不能通过 stage
+                    # payload 注入或替换恢复绑定。
+                    "session_id": attempt_session_id,
+                    "executor_attempt_id": attempt_executor_id,
+                    "resume_available": attempt_resume_available,
+                    "resume_reason": attempt_resume_reason,
+                    "visual_match_snapshot": (
+                        {
+                            "protocol_version": attempt.visual_snapshot_protocol_version,
+                            "snapshot_sha256": attempt.visual_snapshot_sha256,
+                            "matched_at": attempt.visual_snapshot_matched_at,
+                            "candidate_count": attempt.visual_snapshot_candidate_count,
+                        }
+                        if attempt is not None
+                        and isinstance(attempt.visual_snapshot_sha256, str)
+                        and len(attempt.visual_snapshot_sha256) == 64
+                        and isinstance(attempt.visual_snapshot_protocol_version, int)
+                        and isinstance(attempt.visual_snapshot_candidate_count, int)
+                        and attempt.visual_snapshot_candidate_count >= 0
+                        else None
+                    ),
+                }
+            )
+        stage_payload = tuple(stage_payload_items)
+        job_status = job.status if isinstance(job.status, str) else "failed"
+        warning_visible = job_status not in {"failed", "blocked", "unknown_execution"}
+        warnings = tuple(
+            {
+                "stage": item.stage,
+                "error": (item.error if isinstance(item.error, Mapping) else {}).get("error", "auto_rename_warning"),
+                "message": "自动重命名未完成",
+                "recoverable": True,
+            }
+            for item in stages
+            if warning_visible and item.stage == "auto_rename" and item.status == "warning"
+        )
+        try:
+            public_policy = normalize_reverse_image_policy(job.reverse_image_policy)
+        except ImageProcessingError:
+            public_policy = "forbid"
+        return ImageProcessingSnapshot(
+            job_id=str(job.id),
+            scope_id=self.scope.scope_id,
+            meme_id=str(job.meme_id),
+            revision=job.revision,
+            image_sha256=job.image_sha256,
+            reverse_image_policy=public_policy,
+            status=job.status,
+            current_stage=job.current_stage,
+            stages=stage_payload,
+            error=job.error,
+            retry_at=job.retry_at,
+            progress=progress,
+            message=message,
+            created_at=job.created_at,
+            updated_at=job.updated_at,
+            completed_at=job.completed_at,
+            auto_name=auto_name,
+            processing_mode=getattr(job, "processing_mode", "normal") or "normal",
+            has_warnings=bool(warnings),
+            warnings=warnings,
+        )
 
     def snapshot(self, job_id: UUID | str) -> ImageProcessingSnapshot | None:
         """读取 job 和阶段有限诊断。"""
@@ -534,111 +913,8 @@ class ImageProcessingRepository:
             if job is None:
                 return None
             stages = self._stages(session, job.id)
-            stage_names = {item.stage for item in stages if isinstance(item.stage, str)}
-            auto_name = bool(getattr(job, "auto_name", False))
-            # 旧三阶段历史只读合成跳过阶段，不写回数据库。
-            if "auto_rename" not in stage_names:
-                synthetic = ImageProcessingStage(scope_id=self.scope.scope_id, job_id=job.id, stage="auto_rename", status="skipped")
-                stage_order = {name: index for index, name in enumerate(STAGES)}
-                stages = sorted(
-                    [*stages, synthetic],
-                    key=lambda row: stage_order.get(row.stage, len(STAGES)) if isinstance(row.stage, str) else len(STAGES),
-                )
-            completed_stages = sum(isinstance(item.status, str) and item.status in STAGE_SETTLED for item in stages)
-            progress = completed_stages / len(STAGES) if stages else None
-            message = None
-            if job.error and isinstance(job.error, Mapping):
-                message = str(job.error.get("message") or job.error.get("error") or "图片处理失败")
-            elif job.current_stage:
-                message = f"阶段：{job.current_stage}"
-            stage_payload_items: list[dict[str, object]] = []
-            for item in stages:
-                attempt = None
-                if item.task_id:
-                    attempt = session.scalar(
-                        select(ImageProcessingAttempt)
-                        .where(
-                            ImageProcessingAttempt.scope_id == self.scope.scope_id,
-                            ImageProcessingAttempt.task_id == item.task_id,
-                            ImageProcessingAttempt.attempt == item.attempt_count,
-                        )
-                    )
-                attempt_session_id = normalize_identifier(attempt.session_id, kind="session") if attempt else None
-                attempt_executor_id = normalize_identifier(attempt.executor_attempt_id, kind="attempt") if attempt else None
-                attempt_resume_available = bool(attempt and attempt.resume_available and attempt_session_id and attempt_executor_id)
-                attempt_resume_reason = attempt.resume_reason if attempt else None
-                if attempt and attempt.resume_available and not attempt_resume_available:
-                    # 旧 attempt 的恢复标识损坏时，阶段详情也必须保持不可续跑。
-                    attempt_resume_reason = "session_not_resumable"
-                stage_payload_items.append(
-                    {
-                        "stage": item.stage,
-                        "status": item.status,
-                        "task_id": item.task_id,
-                        "attempt": item.attempt_count,
-                        "error": item.error,
-                        "retry_at": item.retry_at,
-                        # 这些字段来自服务端 attempt 事实，前端不能通过 stage
-                        # payload 注入或替换恢复绑定。
-                        "session_id": attempt_session_id,
-                        "executor_attempt_id": attempt_executor_id,
-                        "resume_available": attempt_resume_available,
-                        "resume_reason": attempt_resume_reason,
-                        "visual_match_snapshot": (
-                            {
-                                "protocol_version": attempt.visual_snapshot_protocol_version,
-                                "snapshot_sha256": attempt.visual_snapshot_sha256,
-                                "matched_at": attempt.visual_snapshot_matched_at,
-                                "candidate_count": attempt.visual_snapshot_candidate_count,
-                            }
-                            if attempt is not None
-                            and isinstance(attempt.visual_snapshot_sha256, str)
-                            and len(attempt.visual_snapshot_sha256) == 64
-                            and isinstance(attempt.visual_snapshot_protocol_version, int)
-                            and isinstance(attempt.visual_snapshot_candidate_count, int)
-                            and attempt.visual_snapshot_candidate_count >= 0
-                            else None
-                        ),
-                    }
-                )
-            stage_payload = tuple(stage_payload_items)
-            job_status = job.status if isinstance(job.status, str) else "failed"
-            warning_visible = job_status not in {"failed", "blocked", "unknown_execution"}
-            warnings = tuple(
-                {
-                    "stage": item.stage,
-                    "error": (item.error if isinstance(item.error, Mapping) else {}).get("error", "auto_rename_warning"),
-                    "message": "自动重命名未完成",
-                    "recoverable": True,
-                }
-                for item in stages
-                if warning_visible and item.stage == "auto_rename" and item.status == "warning"
-            )
-            try:
-                public_policy = normalize_reverse_image_policy(job.reverse_image_policy)
-            except ImageProcessingError:
-                public_policy = "forbid"
-            return ImageProcessingSnapshot(
-                job_id=str(job.id),
-                scope_id=self.scope.scope_id,
-                meme_id=str(job.meme_id),
-                revision=job.revision,
-                image_sha256=job.image_sha256,
-                reverse_image_policy=public_policy,
-                status=job.status,
-                current_stage=job.current_stage,
-                stages=stage_payload,
-                error=job.error,
-                retry_at=job.retry_at,
-                progress=progress,
-                message=message,
-                created_at=job.created_at,
-                updated_at=job.updated_at,
-                completed_at=job.completed_at,
-                auto_name=auto_name,
-                has_warnings=bool(warnings),
-                warnings=warnings,
-            )
+            attempts = self._attempts(session, (item.task_id for item in stages if item.task_id))
+            return self._project_snapshot(job, stages, attempts)
 
     def claim(self, job_id: UUID | str, *, owner: str, lease_seconds: int = 120) -> ImageProcessingJob | None:
         """以 owner/generation fencing 认领 queued 或过期 job。"""
@@ -666,8 +942,6 @@ class ImageProcessingRepository:
         """按 job claim 更新阶段并在最后阶段完成 job，影响行数为零即 fencing 拒绝。"""
         if stage not in STAGES or status not in {"queued", "running", "succeeded", "failed", "blocked", "unknown_execution", "skipped", "warning"} or not isinstance(owner, str) or not owner or not isinstance(claim_generation, int) or claim_generation < 1:
             raise ImageProcessingError("invalid_stage_transition")
-        if status == "skipped" and stage != "auto_rename":
-            raise ImageProcessingError("invalid_stage_transition")
         if status == "warning":
             warning_code = error.get("error") if isinstance(error, Mapping) else None
             if stage != "auto_rename" or warning_code not in AUTO_RENAME_WARNING_ERRORS:
@@ -683,6 +957,8 @@ class ImageProcessingRepository:
             if current is None:
                 session.commit()
                 return False
+            if status == "skipped" and bool(getattr(current, "planned", True)):
+                raise ImageProcessingError("invalid_stage_transition")
             pending_stage = next((item.stage for item in self._stages(session, job.id) if item.status not in STAGE_SETTLED), None)
             if pending_stage != stage:
                 # 只允许固定顺序的第一个未收束阶段写回；旧叶子 Task
@@ -737,6 +1013,34 @@ class ImageProcessingRepository:
             session.commit()
             return True
 
+    def fail_job(self, job_id: UUID | str, *, owner: str, claim_generation: int, error: dict[str, object]) -> bool:
+        """在没有可推进阶段时收束父 Job，专用于固定计划失效。"""
+        now = utcnow()
+        with self._session() as session:
+            job = session.scalar(
+                select(ImageProcessingJob)
+                .where(
+                    ImageProcessingJob.scope_id == self.scope.scope_id,
+                    ImageProcessingJob.id == UUID(str(job_id)),
+                    ImageProcessingJob.status == "running",
+                    ImageProcessingJob.lease_owner == owner,
+                    ImageProcessingJob.claim_generation == claim_generation,
+                    ImageProcessingJob.lease_expires_at > now,
+                )
+                .with_for_update()
+            )
+            if job is None:
+                session.commit()
+                return False
+            job.status = "failed"
+            job.error = error
+            job.completed_at = now
+            job.updated_at = now
+            job.lease_owner = None
+            job.lease_expires_at = None
+            session.commit()
+            return True
+
     def update_metadata_hash(self, job_id: UUID | str, *, owner: str, claim_generation: int, metadata_hash: str) -> bool:
         """在当前 job claim 内冻结 Agent 写回后的最新 metadata hash。"""
         if not isinstance(metadata_hash, str) or len(metadata_hash) != 64 or any(char not in "0123456789abcdefABCDEF" for char in metadata_hash):
@@ -776,14 +1080,14 @@ class ImageProcessingRepository:
             previous_config = dict(old.processing_config or {})
             old_policy = old.reverse_image_policy
             old_auto_name = bool(getattr(old, "auto_name", False))
-        return self.create_or_reuse(
+        return ImageProcessingSubmissionCoordinator(self.resources, self.scope).create_job(
             meme_id,
             sha,
             metadata_hash=metadata_hash,
             config=previous_config if config is None else config,
             reverse_image_policy=old_policy if policy is None else policy,
             auto_name=old_auto_name if auto_name is None else auto_name,
-            explicit_retry=True,
+            processing_mode="full_retry",
         )
 
     def list(self, *, limit: int = 100) -> list[ImageProcessingSnapshot]:
@@ -820,21 +1124,38 @@ class ImageProcessingRepository:
                 .where(
                     ImageProcessingJob.scope_id == self.scope.scope_id,
                     ImageProcessingJob.meme_id == identifier,
-                    ImageProcessingJob.image_sha256 == image_sha256,
+                    ImageProcessingJob.image_sha256 == str(image_sha256).lower(),
                 )
-                .order_by(ImageProcessingJob.revision.desc(), ImageProcessingJob.created_at.desc())
+                .order_by(ImageProcessingJob.revision.desc(), ImageProcessingJob.created_at.desc(), ImageProcessingJob.id.desc())
             )
             if job is None:
                 return None
             job_id = job.id
         return self.snapshot(job_id)
 
+    def has_active_image_task(self, meme_id: UUID | str, image_sha256: str) -> bool:
+        """读取同图活动叶子 Task，供批量修复的快速就绪判断使用。
+
+        该查询只是提交前的提示，真正的活动门禁仍由图片 advisory lock 内的提交事务
+        再次检查；这样批量枚举不会把活动独立阶段误报告为“无需修复”。
+        """
+        try:
+            identifier = UUID(str(meme_id))
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(image_sha256, str) or len(image_sha256) != 64:
+            return False
+        with self._session() as session:
+            return self._has_active_image_task(session, identifier, image_sha256.lower())
+
     def latest_for_targets(self, targets: Iterable[tuple[UUID | str, str]]) -> dict[UUID, ImageProcessingSnapshot]:
         """批量读取当前页每个 `(meme_id, image_sha256)` 的最新处理快照。"""
         normalized: dict[UUID, str] = {}
         for meme_id, image_sha256 in targets:
             try:
-                normalized[UUID(str(meme_id))] = str(image_sha256).lower()
+                if not isinstance(image_sha256, str):
+                    continue
+                normalized[UUID(str(meme_id))] = image_sha256.lower()
             except (TypeError, ValueError):
                 continue
         if not normalized:
@@ -845,16 +1166,39 @@ class ImageProcessingRepository:
                     select(ImageProcessingJob)
                     .where(
                         ImageProcessingJob.scope_id == self.scope.scope_id,
-                        ImageProcessingJob.meme_id.in_(tuple(normalized)),
+                        tuple_(ImageProcessingJob.meme_id, ImageProcessingJob.image_sha256).in_(tuple(normalized.items())),
                     )
-                    .order_by(ImageProcessingJob.meme_id.asc(), ImageProcessingJob.revision.desc(), ImageProcessingJob.created_at.desc())
+                    .order_by(
+                        ImageProcessingJob.meme_id.asc(),
+                        ImageProcessingJob.revision.desc(),
+                        ImageProcessingJob.created_at.desc(),
+                        ImageProcessingJob.id.desc(),
+                    )
                 )
             )
-            selected: dict[UUID, UUID] = {}
+            selected: dict[UUID, ImageProcessingJob] = {}
             for job in jobs:
-                if job.meme_id not in selected and normalized.get(job.meme_id) == str(job.image_sha256).lower():
-                    selected[job.meme_id] = job.id
-        return {meme_id: snapshot for meme_id, job_id in selected.items() if (snapshot := self.snapshot(job_id)) is not None}
+                if job.meme_id not in selected:
+                    selected[job.meme_id] = job
+            if not selected:
+                return {}
+
+            job_ids = tuple(job.id for job in selected.values())
+            stages_by_job: dict[UUID, list[ImageProcessingStage]] = {job_id: [] for job_id in job_ids}
+            stage_rows = session.scalars(
+                select(ImageProcessingStage).where(
+                    ImageProcessingStage.scope_id == self.scope.scope_id,
+                    ImageProcessingStage.job_id.in_(job_ids),
+                )
+            )
+            for stage in stage_rows:
+                stages_by_job.setdefault(stage.job_id, []).append(stage)
+            stages_by_job = {job_id: self._sort_stages(rows) for job_id, rows in stages_by_job.items()}
+            attempts = self._attempts(session, (stage.task_id for rows in stages_by_job.values() for stage in rows if stage.task_id))
+            return {
+                meme_id: self._project_snapshot(job, stages_by_job.get(job.id, []), attempts)
+                for meme_id, job in selected.items()
+            }
 
     def attach_task(
         self,
@@ -949,6 +1293,64 @@ class ImageProcessingRepository:
             return True
 
 
+class ImageProcessingSubmissionCoordinator:
+    """统一图片用户提交的 Job 事务边界。
+
+    完整重试和修复必须在创建父 Job 前完成同图活动检查。该协调器把图片 advisory
+    lock、Job 查询和固定计划写入放在一个短 Session 中；文件读取、grant、调度和
+    模型调用由调用方在事务提交后执行。独立阶段由 ``TaskRepository.submit`` 使用
+    同一把图片锁完成对应检查和插入。
+    """
+
+    def __init__(self, resources: Any, scope_id: ScopeContext | str):
+        """绑定共享数据库资源和当前 scope。"""
+        self.resources = resources
+        self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
+        self.jobs = ImageProcessingRepository(resources, self.scope)
+
+    def create_job(
+        self,
+        meme_id: UUID | str,
+        image_sha256: str,
+        *,
+        metadata_hash: str | None = None,
+        config: Mapping[str, object] | None = None,
+        reverse_image_policy: object = None,
+        auto_name: object = None,
+        processing_mode: str = "normal",
+        explicit_retry: bool = False,
+    ) -> ImageProcessingJob:
+        """在提交事务内创建完整重试或修复 Job，并返回已持久化的 ORM 行。"""
+        environment_factory = getattr(self.resources, "environment", None)
+        if callable(environment_factory):
+            with environment_factory(self.scope) as environment:
+                return self.jobs.create_queued_in_session(
+                    environment.uow.session,
+                    meme_id,
+                    image_sha256,
+                    metadata_hash=metadata_hash,
+                    config=config,
+                    reverse_image_policy=reverse_image_policy,
+                    auto_name=auto_name,
+                    processing_mode=processing_mode,
+                    explicit_retry=explicit_retry,
+                )
+        with self.resources.factory() as session:
+            job = self.jobs.create_queued_in_session(
+                session,
+                meme_id,
+                image_sha256,
+                metadata_hash=metadata_hash,
+                config=config,
+                reverse_image_policy=reverse_image_policy,
+                auto_name=auto_name,
+                processing_mode=processing_mode,
+                explicit_retry=explicit_retry,
+            )
+            session.commit()
+            return job
+
+
 class ImageProcessingWorker:
     """按 job scope 调度四阶段叶子 Task 的有界 Worker。"""
 
@@ -958,6 +1360,7 @@ class ImageProcessingWorker:
         self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
         self.tasks = task_service
         self.jobs = ImageProcessingRepository(resources, self.scope)
+        self.submissions = ImageProcessingSubmissionCoordinator(resources, self.scope)
         # stage plan 只描述顺序；具体 Job 的 auto_name 选项在 reconcile 时冻结。
         self.stage_plan = ImageStagePlan()
         self.policy = policy or OperationPolicyGateway(None)
@@ -1004,9 +1407,46 @@ class ImageProcessingWorker:
         self._scheduled: set[str] = set()
         self._lock = threading.RLock()
 
-    def submit(self, meme_id: UUID | str, image_sha256: str, *, metadata_hash: str | None = None, config: Mapping[str, object] | None = None, reverse_image_policy: object = None, auto_name: object = None, explicit_retry: bool = False, schedule: bool = True) -> ImageProcessingSnapshot:
-        """创建/复用 job 并安排逐图处理，不等待任一叶子 Task。"""
-        job = self.jobs.create_or_reuse(meme_id, image_sha256, metadata_hash=metadata_hash, config=config, reverse_image_policy=reverse_image_policy, auto_name=auto_name, explicit_retry=explicit_retry)
+    def submit(
+        self,
+        meme_id: UUID | str,
+        image_sha256: str,
+        *,
+        metadata_hash: str | None = None,
+        config: Mapping[str, object] | None = None,
+        reverse_image_policy: object = None,
+        auto_name: object = None,
+        processing_mode: str = "normal",
+        explicit_retry: bool = False,
+        schedule: bool = True,
+    ) -> ImageProcessingSnapshot:
+        """创建固定处理方式的 Job 并安排逐图处理，不等待任一叶子 Task。"""
+        if explicit_retry and processing_mode == "normal":
+            processing_mode = "full_retry"
+        if processing_mode in {"full_retry", "repair"} and callable(getattr(self.resources, "environment", None)):
+            # 用户重新处理在共享图片提交事务内完成活动门禁和父 Job 创建；grant、
+            # 文件校验、调度与模型调用均在该事务提交后继续。
+            job = self.submissions.create_job(
+                meme_id,
+                image_sha256,
+                metadata_hash=metadata_hash,
+                config=config,
+                reverse_image_policy=reverse_image_policy,
+                auto_name=auto_name,
+                processing_mode=processing_mode,
+                explicit_retry=False,
+            )
+        else:
+            job = self.jobs.create_or_reuse(
+                meme_id,
+                image_sha256,
+                metadata_hash=metadata_hash,
+                config=config,
+                reverse_image_policy=reverse_image_policy,
+                auto_name=auto_name,
+                processing_mode=processing_mode,
+                explicit_retry=False,
+            )
         if schedule:
             self.schedule(job.id)
         snapshot = self.jobs.snapshot(job.id)
@@ -1130,8 +1570,9 @@ class ImageProcessingWorker:
         """提交或复用一个无父 Job 的独立图片阶段 Task。
 
         目标 SHA、阶段配置、处理选项和 scope 均由当前数据库 Meme 与服务端配置派生。
-        活动任务按持久 dedupe key 复用；终态任务因不再属于活动集合而由同一
-        请求创建新的逻辑 Task。只有 Agent 阶段会在 Task 建立后取得 grant。
+        用户请求命中同图活动 Job 或 Task 时返回稳定冲突；只有父 Job 内部重复
+        reconcile 才按持久 dedupe key 复用叶子 Task。终态任务因不再属于活动集合，
+        由下一次用户请求创建新的逻辑 Task。只有 Agent 阶段会在 Task 建立后取得 grant。
 
         ``auto_name`` 会随共享处理确认写入独立 Task 输入，避免选项在公共 HTTP 边界
         丢失；独立阶段本身不负责编排自动命名的下游阶段。
@@ -1164,6 +1605,7 @@ class ImageProcessingWorker:
 
         payload: dict[str, object] = {
             "submission_mode": "standalone",
+            "_user_image_submission": True,
             "stage": canonical,
             "meme_id": str(identifier),
             "image_sha256": image_sha256,
@@ -1187,6 +1629,7 @@ class ImageProcessingWorker:
                 {
                     "expected_storage_key": meme.storage_key,
                     "expected_meme_revision": meme.revision,
+                    "expected_display_name": meme.display_name,
                     "title_fingerprint": stable_input_digest(title),
                 }
             )
@@ -1205,7 +1648,9 @@ class ImageProcessingWorker:
             payload["visual_match_snapshot_protocol_version"] = 2
         submitter = self._task_runner or self.tasks
         dedupe_key = self._task_dedupe_key(task_type, payload)
-        active_task_id = self._find_active_task(submitter, task_type, dedupe_key)
+        # 用户独立阶段不适用内部叶子 Task 的活动复用；真正的同图冲突检查
+        # 在 submitter 的持久化事务内完成，避免预检把旧 Task 当成本次成功。
+        active_task_id = None if payload.get("_user_image_submission") is True else self._find_active_task(submitter, task_type, dedupe_key)
         if active_task_id is not None:
             existing = submitter.get(active_task_id) if callable(getattr(submitter, "get", None)) else None
             if existing is not None:
@@ -1213,6 +1658,10 @@ class ImageProcessingWorker:
 
         try:
             record = submitter.submit(task_type, payload, schedule=False)
+        except DatabaseError as exc:
+            if exc.code in {"image_processing_active", "image_target_changed", "image_processing_job_invalid", "image_target_required"}:
+                raise ImageProcessingError(exc.code) from exc
+            raise
         except Exception as exc:
             raise exc
         task_id = self._task_identifier(record)
@@ -1306,19 +1755,50 @@ class ImageProcessingWorker:
 
     @staticmethod
     def _metadata_hash(meme: Meme) -> str | None:
-        """按七个语义字段计算当前 Meme metadata hash。"""
-        stored = getattr(meme, "search_metadata_hash", None)
-        if isinstance(stored, str) and len(stored) == 64:
-            return stored
+        """按七个语义字段计算当前 Meme hash，并拒绝错误的已存值。"""
         try:
-            return semantic_document_hash(MemeContext.model_validate(meme.meme_context or {}))
+            expected = semantic_document_hash(MemeContext.model_validate(meme.meme_context or {}))
         except Exception:  # noqa: BLE001 - 非法历史元数据只表示阶段尚未有效
             return None
+        stored = getattr(meme, "search_metadata_hash", None)
+        if stored is not None and (not isinstance(stored, str) or stored != expected):
+            return None
+        return expected
+
+    def _target_valid(self, job: ImageProcessingJob) -> bool:
+        """只校验计划阶段执行和写回所需的当前图片身份。"""
+        with self.resources.factory() as session:
+            meme = session.scalar(
+                select(Meme).where(
+                    Meme.scope_id == self.scope.scope_id,
+                    Meme.id == job.meme_id,
+                )
+            )
+            if meme is None or meme.sha256.lower() != job.image_sha256.lower():
+                return False
+            file_identity = _image_file_identity(meme)
+        try:
+            blob_store = self.resources.blob_store_for_scope(self.scope)
+        except (AttributeError, TypeError, ValueError, OSError, DatabaseError):
+            return False
+        if not image_file_matches(self.resources, self.scope, meme, blob_store=blob_store):
+            return False
+        with self.resources.factory() as session:
+            current = session.scalar(
+                select(Meme).where(
+                    Meme.scope_id == self.scope.scope_id,
+                    Meme.id == job.meme_id,
+                )
+            )
+            return current is not None and _image_file_identity(current) == file_identity and current.sha256.lower() == job.image_sha256.lower()
 
     def _stage_valid(self, job: ImageProcessingJob, stage: str) -> bool:
         """重新校验目标和阶段产物，返回当前阶段是否可以安全复用。"""
         if stage not in STAGES:
             raise ImageProcessingError("invalid_stage_transition")
+
+        # 先在一个很短的事务中读取图片身份和 BlobStore 所需的 scope 事实；
+        # 文件校验可能较慢，必须在事务结束、连接归还连接池后执行。
         with self.resources.factory() as session:
             meme = session.scalar(
                 select(Meme).where(
@@ -1438,12 +1918,16 @@ class ImageProcessingWorker:
             if snapshot is None:
                 return
             statuses = {str(item["stage"]): str(item["status"]) for item in snapshot.stages if isinstance(item, Mapping)}
+            planned = {str(item["stage"]): bool(item.get("planned", item.get("status") != "skipped")) for item in snapshot.stages if isinstance(item, Mapping)}
             plan = ImageStagePlan(auto_name=bool(getattr(job, "auto_name", False)))
             # 失败/阻止/未知阶段必须等待显式重试；不能因 reconcile 扫描再次创建
             # 同一图片版本的 provider Task，避免重复外部副作用和重复计量。
-            if plan.blocked(statuses):
+            if plan.blocked(statuses, planned):
                 return
-            name = plan.next_stage(statuses)
+            if not self._skipped_plan_valid(job, snapshot.stages):
+                self.jobs.fail_job(job.id, owner=self.owner, claim_generation=job.claim_generation, error={"error": "image_processing_plan_stale"})
+                return
+            name = plan.next_stage(statuses, planned)
             if name is None:
                 return
             stage = next((item for item in snapshot.stages if item.get("stage") == name), None)
@@ -1455,9 +1939,7 @@ class ImageProcessingWorker:
                 # storage key 重新计算 metadata hash 再冻结文本 Task 输入。
                 self._refresh_metadata_hash(job)
 
-            try:
-                valid = self._stage_valid(job, name)
-            except ImageProcessingError as exc:
+            if not self._target_valid(job):
                 self.jobs.transition(
                     job.id,
                     name,
@@ -1465,15 +1947,8 @@ class ImageProcessingWorker:
                     claim_generation=job.claim_generation,
                     status="failed",
                     task_id=str(task_id) if task_id else None,
-                    error={"error": exc.code},
+                    error={"error": "target_changed"},
                 )
-                return
-            if valid:
-                if stage["status"] != "succeeded":
-                    if not self.jobs.transition(job.id, name, owner=self.owner, claim_generation=job.claim_generation, status="succeeded", task_id=str(task_id) if task_id else None):
-                        return
-                if name != STAGES[-1]:
-                    reschedule = True
                 return
 
             if not task_id:
@@ -1507,6 +1982,9 @@ class ImageProcessingWorker:
                     return
                 child = self.tasks.get(str(task_id)) if callable(getattr(self.tasks, "get", None)) else None
             if child is not None and child.status == "succeeded":
+                if not self._skipped_plan_valid(job, snapshot.stages):
+                    self.jobs.fail_job(job.id, owner=self.owner, claim_generation=job.claim_generation, error={"error": "image_processing_plan_stale"})
+                    return
                 self.jobs.transition(job.id, name, owner=self.owner, claim_generation=job.claim_generation, status="succeeded", task_id=str(task_id))
                 if name == "auto_rename":
                     self._refresh_metadata_hash(job)
@@ -1519,6 +1997,9 @@ class ImageProcessingWorker:
                 terminal_status = "unknown_execution" if stage_error in {"unknown_execution", "reverse_image_unknown_execution", "auto_rename_unknown_execution"} else "failed"
                 if name == "auto_rename" and stage_error in {"auto_rename_title_missing", "auto_rename_invalid_filename", "auto_rename_target_exists", "auto_rename_target_changed"}:
                     terminal_status = "warning"
+                if terminal_status == "warning" and not self._skipped_plan_valid(job, snapshot.stages):
+                    self.jobs.fail_job(job.id, owner=self.owner, claim_generation=job.claim_generation, error={"error": "image_processing_plan_stale"})
+                    return
                 self.jobs.transition(job.id, name, owner=self.owner, claim_generation=job.claim_generation, status=terminal_status, task_id=str(task_id), error={"error": stage_error})
                 if name == "auto_rename" and terminal_status == "warning":
                     self._refresh_metadata_hash(job)
@@ -1540,6 +2021,9 @@ class ImageProcessingWorker:
                 handler(handler_payload)
             except ImageProcessingError as exc:
                 terminal_status = "warning" if name == "auto_rename" and exc.code in {"auto_rename_title_missing", "auto_rename_invalid_filename", "auto_rename_target_exists", "auto_rename_target_changed"} else exc.code if exc.code in {"blocked", "unknown_execution"} else "failed"
+                if terminal_status == "warning" and not self._skipped_plan_valid(job, snapshot.stages):
+                    self.jobs.fail_job(job.id, owner=self.owner, claim_generation=job.claim_generation, error={"error": "image_processing_plan_stale"})
+                    return
                 self.jobs.transition(job.id, name, owner=self.owner, claim_generation=job.claim_generation, status=terminal_status, task_id=str(task_id), error={"error": exc.code}, retry_at=exc.retry_at)
                 if terminal_status == "warning":
                     self._refresh_metadata_hash(job)
@@ -1554,12 +2038,18 @@ class ImageProcessingWorker:
                 else:
                     terminal_status = "failed"
                     code = "stage_failed"
+                if terminal_status == "warning" and not self._skipped_plan_valid(job, snapshot.stages):
+                    self.jobs.fail_job(job.id, owner=self.owner, claim_generation=job.claim_generation, error={"error": "image_processing_plan_stale"})
+                    return
                 self.jobs.transition(job.id, name, owner=self.owner, claim_generation=job.claim_generation, status=terminal_status, task_id=str(task_id), error={"error": code})
                 if terminal_status == "warning":
                     self._refresh_metadata_hash(job)
                     reschedule = True
                 logger.info("image_processing_stage_failed job=%s stage=%s error=%s", job.id, name, type(exc).__name__)
             else:
+                if not self._skipped_plan_valid(job, snapshot.stages):
+                    self.jobs.fail_job(job.id, owner=self.owner, claim_generation=job.claim_generation, error={"error": "image_processing_plan_stale"})
+                    return
                 self.jobs.transition(job.id, name, owner=self.owner, claim_generation=job.claim_generation, status="succeeded", task_id=str(task_id))
                 if name != STAGES[-1]:
                     reschedule = True
@@ -1568,6 +2058,26 @@ class ImageProcessingWorker:
                 self._scheduled.discard(str(job_id))
             if reschedule and not self._stopped.is_set():
                 self.schedule(job_id)
+
+    def _skipped_plan_valid(self, job: ImageProcessingJob, stages: Iterable[Mapping[str, object]]) -> bool:
+        """复核创建时跳过的核心阶段依据，防止父 Job 带过期产物成功收束。"""
+        for item in stages:
+            if (
+                not isinstance(item, Mapping)
+                or bool(item.get("planned", item.get("status") != "skipped"))
+                or item.get("skip_reason") != "already_ready"
+                or item.get("stage") not in {"visual", "agent", "text_embedding"}
+            ):
+                continue
+            try:
+                if not self._stage_valid(job, str(item["stage"])):
+                    return False
+            except ImageProcessingError:
+                return False
+            except Exception as exc:  # noqa: BLE001 - 计划依据校验必须 fail-closed
+                logger.info("image_processing_plan_validation_failed job=%s stage=%s error=%s", getattr(job, "id", None), item.get("stage"), type(exc).__name__)
+                return False
+        return True
 
     def _refresh_metadata_hash(self, job: ImageProcessingJob) -> None:
         """把当前 Meme 语境指纹写回 job，避免 Agent 成功后沿用旧 hash。"""
@@ -1612,12 +2122,13 @@ class ImageProcessingWorker:
                 revision=payload.get("job_revision") or "legacy",
             )
         if task_type == "image_auto_rename":
-            return "rename:{mode}:{stage}:{meme}:{sha}:{storage}:{title}:r{revision}".format(
+            return "rename:{mode}:{stage}:{meme}:{sha}:{storage}:{display}:{title}:r{revision}".format(
                 mode=mode,
                 stage=stage,
                 meme=payload.get("meme_id"),
                 sha=payload.get("image_sha256"),
                 storage=payload.get("expected_storage_key"),
+                display=payload.get("expected_display_name"),
                 title=payload.get("title_fingerprint"),
                 revision=payload.get("job_revision") or "legacy",
             )
@@ -1703,6 +2214,7 @@ class ImageProcessingWorker:
                 {
                     "expected_storage_key": meme.storage_key,
                     "expected_meme_revision": meme.revision,
+                    "expected_display_name": meme.display_name,
                     "title_fingerprint": stable_input_digest(title),
                 }
             )
@@ -1843,12 +2355,102 @@ class SingleImageEmbeddingService:
         self.dimensions = EMBEDDING_DIMENSIONS
         self.embedder = embedder
 
-    def upsert(self, meme_id: UUID | str, *, image_sha256: str, metadata_hash: str, semantic_document: str) -> MemeTextEmbedding:
-        """生成并原子提交单图向量；旧指纹不会覆盖新内容。"""
-        if not semantic_document.strip():
+    def _assert_claim(self, session: Any, claim: tuple[str, int, str] | None) -> None:
+        """在文本向量写事务中锁定并验证 Worker claim，拒绝过期任务。"""
+        if claim is None:
+            return
+        try:
+            task_id, claim_generation, owner = claim
+        except (TypeError, ValueError) as exc:
+            raise ImageProcessingError("claim_expired") from exc
+        now = utcnow()
+        task = session.scalar(
+            select(Task)
+            .where(
+                Task.scope_id == self.scope.scope_id,
+                Task.id == task_id,
+                Task.claim_generation == claim_generation,
+                Task.lease_owner == owner,
+                Task.status == "running",
+                Task.lease_expires_at > now,
+            )
+            .with_for_update()
+        )
+        if task is None:
+            raise ImageProcessingError("claim_expired")
+
+    def _locked_target(
+        self,
+        session: Any,
+        identifier: UUID,
+        *,
+        image_sha256: str,
+        metadata_hash: str,
+        semantic_value: str,
+    ) -> Meme:
+        """锁定并验证当前 Meme 的图片、语境状态和七字段语义指纹。"""
+        meme = session.scalar(
+            select(Meme)
+            .where(Meme.scope_id == self.scope.scope_id, Meme.id == identifier)
+            .with_for_update()
+        )
+        if meme is None or str(meme.sha256).lower() != image_sha256:
+            raise ImageProcessingError("target_changed")
+        if meme.context_status in {"pending", "repair_required"}:
+            raise ImageProcessingError("target_changed")
+        try:
+            context = MemeContext.model_validate(meme.meme_context or {})
+            current_document = semantic_document(context)
+            current_hash = semantic_document_hash(context)
+        except (TypeError, ValueError) as exc:
+            raise ImageProcessingError("target_changed") from exc
+        if (
+            not current_document
+            or current_hash is None
+            or current_document != semantic_value
+            or current_hash != metadata_hash
+            or getattr(meme, "search_metadata_hash", None) != current_hash
+        ):
+            raise ImageProcessingError("target_changed")
+        return meme
+
+    def upsert(self, meme_id: UUID | str, *, image_sha256: str, metadata_hash: str, semantic_document: str, claim: tuple[str, int, str] | None = None) -> MemeTextEmbedding:
+        """生成并原子提交单图向量；旧指纹不会覆盖新内容。
+
+        可选 claim、scope、图片 SHA 和语义 hash 都在同一写事务中验证，供缓存回填
+        Worker 的外部模型调用完成后执行 fencing 写回。
+        """
+        if not isinstance(semantic_document, str) or not semantic_document.strip():
             raise ImageProcessingError("query_embedding_not_ready")
         if self.embedder is None:
             raise ImageProcessingError("embedding_not_configured")
+        if (
+            not isinstance(image_sha256, str)
+            or len(image_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in image_sha256)
+            or not isinstance(metadata_hash, str)
+            or len(metadata_hash) != 64
+            or any(character not in "0123456789abcdef" for character in metadata_hash)
+        ):
+            raise ImageProcessingError("target_changed")
+        image_sha256 = image_sha256.lower()
+        metadata_hash = metadata_hash.lower()
+        try:
+            identifier = UUID(str(meme_id))
+        except (TypeError, ValueError) as exc:
+            raise ImageProcessingError("target_changed") from exc
+
+        # 先做一次短读事务，避免在语境已经 pending/repair_required 或输入指纹
+        # 过期时调用外部模型；模型调用本身不能持有数据库锁。
+        with self.resources.factory() as session:
+            self._assert_claim(session, claim)
+            self._locked_target(
+                session,
+                identifier,
+                image_sha256=image_sha256,
+                metadata_hash=metadata_hash,
+                semantic_value=semantic_document,
+            )
         vector = [float(value) for value in self.embedder(semantic_document)]
         if len(vector) != self.dimensions:
             raise ImageProcessingError("embedding_dimensions_mismatch")
@@ -1858,12 +2460,14 @@ class SingleImageEmbeddingService:
         if not math.isfinite(norm) or norm <= 0:
             raise ImageProcessingError("embedding_zero_norm")
         with self.resources.factory() as session:
-            meme = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))).with_for_update())
-            if meme is None or meme.sha256 != image_sha256:
-                raise ImageProcessingError("target_changed")
-            current_metadata_hash = ImageProcessingWorker._metadata_hash(meme)
-            if current_metadata_hash is None or current_metadata_hash != metadata_hash:
-                raise ImageProcessingError("target_changed")
+            self._assert_claim(session, claim)
+            meme = self._locked_target(
+                session,
+                identifier,
+                image_sha256=image_sha256,
+                metadata_hash=metadata_hash,
+                semantic_value=semantic_document,
+            )
             statement = select(MemeTextEmbedding).where(MemeTextEmbedding.scope_id == self.scope.scope_id, MemeTextEmbedding.meme_id == meme.id, MemeTextEmbedding.image_sha256 == image_sha256, MemeTextEmbedding.metadata_hash == metadata_hash, MemeTextEmbedding.embedding_model_version == self.model).with_for_update()
             row = session.scalar(statement)
             if row is None:
@@ -1878,49 +2482,24 @@ class SingleImageEmbeddingService:
             return row
 
     def query(self, vector: Iterable[float], *, limit: int = 5) -> list[str]:
-        """只查询当前 scope 且仍匹配 Meme 当前 SHA 的 ready 向量。"""
-        values = [float(item) for item in vector]
+        """委托当前 scope 的 SearchRepository 执行有界 pgvector 查询。
+
+        输入是查询向量和结果数量，输出是稳定的 Meme ID 字符串；向量过滤、余弦
+        排序和 ``cache_not_ready`` 门禁统一由搜索 repository 负责，避免处理模块
+        维护另一套全量 Python 排序实现。
+        """
+        try:
+            values = [float(item) for item in vector]
+        except (TypeError, ValueError) as exc:
+            raise ImageProcessingError("embedding_invalid") from exc
         if len(values) != self.dimensions:
             raise ImageProcessingError("embedding_dimensions_mismatch")
-        with self.resources.factory() as session:
-            rows = list(
-                session.execute(
-                    select(MemeTextEmbedding, Meme)
-                    .join(Meme, (Meme.scope_id == MemeTextEmbedding.scope_id) & (Meme.id == MemeTextEmbedding.meme_id))
-                    .where(
-                        MemeTextEmbedding.scope_id == self.scope.scope_id,
-                        MemeTextEmbedding.embedding_model_version == self.model,
-                        MemeTextEmbedding.dimensions == self.dimensions,
-                        MemeTextEmbedding.status == "ready",
-                        MemeTextEmbedding.embedding.is_not(None),
-                        Meme.sha256 == MemeTextEmbedding.image_sha256,
-                    )
-                    .order_by(MemeTextEmbedding.updated_at.desc(), MemeTextEmbedding.meme_id.asc())
-                    .limit(500)
-                )
-            )
-            scored: list[tuple[float, str]] = []
-            norm = sum(value * value for value in values) ** 0.5
-            if not math.isfinite(norm) or norm <= 0:
-                raise ImageProcessingError("embedding_zero_norm")
-            for row, meme in rows:
-                # 语境 hash 与图片 SHA 都必须仍匹配当前 Meme，历史向量不能因模型相似而混入结果。
-                if ImageProcessingWorker._metadata_hash(meme) != row.metadata_hash:
-                    continue
-                try:
-                    candidate = [float(item) for item in row.embedding or []]
-                    if len(candidate) != self.dimensions:
-                        continue
-                    candidate_norm = sum(item * item for item in candidate) ** 0.5
-                    if not math.isfinite(candidate_norm) or candidate_norm <= 0 or not all(math.isfinite(item) for item in candidate):
-                        continue
-                    score = sum(left * right for left, right in zip(values, candidate)) / (norm * candidate_norm)
-                except (TypeError, ValueError, ZeroDivisionError):
-                    continue
-                scored.append((score, str(row.meme_id)))
-            scored.sort(key=lambda item: (-item[0], item[1]))
-            # 同一 Meme 可能保留多个历史 metadata hash；只返回一次最新相关结果。
-            return list(dict.fromkeys(identifier for _score, identifier in scored))[: max(1, min(limit, 100))]
+        try:
+            with self.resources.environment(self.scope) as environment:
+                ranked = environment.search.query(self.model, values, limit)
+        except DatabaseError as exc:
+            raise ImageProcessingError(getattr(exc, "code", str(exc))) from exc
+        return [str(meme_id) for meme_id, _score in ranked]
 
 
 def seed_jobs(repository: ImageProcessingRepository, memes: Iterable[object], *, config: Mapping[str, object] | None = None, reverse_image_policy: object = None, page_size: int = 100) -> int:

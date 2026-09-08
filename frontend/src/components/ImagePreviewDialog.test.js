@@ -136,7 +136,7 @@ describe('ImagePreviewDialog', () => {
     expect(source.attributes('title')).toBe('https://example.com/articles/meme')
 
     expect(wrapper.find('.metadata-json').exists()).toBe(false)
-    expect(wrapper.get('.image-processing-details').text()).toContain('Agent 语境')
+    expect(wrapper.get('.image-processing-details').text()).toContain('图片语境分析')
     wrapper.unmount()
   })
 

@@ -28,11 +28,9 @@ def test_search_query_dispatches_to_one_migration_source(monkeypatch):
     vector = [1.0] * EMBEDDING_DIMENSIONS
     monkeypatch.setattr(repository, "source_mode", lambda _model: "incremental")
     monkeypatch.setattr(repository, "query_incremental", lambda _model, _vector, _limit: [(uuid4(), 1.0)])
-    monkeypatch.setattr(repository, "_query_legacy_validated", lambda *_args: pytest.fail("不应查询旧 generation"))
     assert len(SearchRepository.query(repository, "model", vector)) == 1
 
-    monkeypatch.setattr(repository, "source_mode", lambda _model: "legacy")
-    monkeypatch.setattr(repository, "_query_legacy_validated", lambda *_args: pytest.fail("旧 generation 不再作为运行时来源"))
+    monkeypatch.setattr(repository, "source_mode", lambda _model: "not_ready")
     monkeypatch.setattr(repository, "query_incremental", lambda *_args: pytest.fail("不应查询增量向量"))
     with pytest.raises(DatabaseError, match="cache_not_ready"):
         SearchRepository.query(repository, "model", vector)

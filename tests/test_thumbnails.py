@@ -426,6 +426,40 @@ def test_projection_schedules_missing_thumbnail_after_fact_commit(tmp_path: Path
     assert scheduled == [meme.id]
 
 
+def test_projection_keeps_pending_when_task_submission_raises_unknown_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """缩略图任务服务抛出未知异常时，列表仍返回 pending 而不暴露内部错误。"""
+    content = _image_bytes((16, 8))
+    service, meme, repository, _source_store, _thumbnail_store = _service(tmp_path, content)
+    monkeypatch.setattr(service, "task_service", object())
+
+    def fail_enqueue(_meme_id):
+        """模拟非领域异常，验证列表投影的异常隔离。"""
+        raise ValueError("task service unavailable")
+
+    monkeypatch.setattr(service, "enqueue", fail_enqueue)
+
+    projection = service.projection(meme, source_identity=(meme.size_bytes, meme.sha256))
+
+    assert projection == {"status": "pending", "media_url": None}
+    assert repository.row is not None and repository.row.status == "pending"
+
+
+@pytest.mark.parametrize("status", ["failed", "stale"])
+def test_projection_does_not_reset_terminal_thumbnail_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+    """列表访问不会清除已有 failed 或 stale，显式重试才可改变状态。"""
+    content = _image_bytes((16, 8))
+    service, meme, repository, _source_store, _thumbnail_store = _service(tmp_path, content)
+    repository.row = repository.ensure_pending(meme, service.config.profile)
+    repository.row.status = status
+    monkeypatch.setattr(service, "task_service", object())
+    monkeypatch.setattr(service, "enqueue", lambda _meme_id: object())
+
+    projection = service.projection(meme, source_identity=(meme.size_bytes, meme.sha256))
+
+    assert projection == {"status": status, "media_url": None}
+    assert repository.row.status == status
+
+
 def test_single_projection_schedules_missing_thumbnail_for_collection_and_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """合集或检索的单图投影也会为没有历史任务的 Meme 触发生成。"""
     content = _image_bytes((16, 8))

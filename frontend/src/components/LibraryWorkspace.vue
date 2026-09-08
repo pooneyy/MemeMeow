@@ -111,6 +111,14 @@ async function loadLibrary(): Promise<void> {
     if (requestId !== libraryRequestId) return
     images.value = data.items
     total.value = Number.isInteger(data.total) ? data.total : data.items.length
+    const nextPageCount = Math.max(1, Math.ceil(total.value / pageSize))
+    if (page.value > nextPageCount) {
+      // 删除或筛选可能让当前深页失效；先清空页内选择，再重新读取合法末页。
+      page.value = nextPageCount
+      selectedImages.value = new Set()
+      await loadLibrary()
+      return
+    }
     if (previewImage.value) {
       previewImage.value = data.items.find((item: MemeImage) => item.meme_id === previewImage.value?.meme_id) || null
     }
@@ -235,20 +243,21 @@ type ImageProcessingStageName = 'visual' | 'agent' | 'auto_rename' | 'text_embed
 
 type RetryResult = UnreadyProcessingResponse['results'][number]
 
-/** 将服务端逐图结果兼容为稳定的提交分类，供摘要和明细共用。 */
-function retryResultCategory(result: RetryResult): 'submitted' | 'reused' | 'conflict' | 'failed' {
-  if (result.category === 'conflict' || result.status === 'conflict') return 'conflict'
+/** 将服务端逐图结果收束为新的四种提交分类，兼容旧字段读取。 */
+function retryResultCategory(result: RetryResult): 'submitted' | 'processing_active' | 'not_needed' | 'failed' {
+  if (result.category === 'processing_active' || result.category === 'conflict' || result.status === 'conflict') return 'processing_active'
+  if (result.category === 'not_needed') return 'not_needed'
   if (result.category === 'failed' || result.status === 'failed' || result.error) return 'failed'
-  if (result.reused === true || result.category === 'reused' || result.status === 'reused') return 'reused'
+  if (result.reused === true || result.category === 'reused' || result.status === 'reused') return 'not_needed'
   return 'submitted'
 }
 
 /** 将逐图分类和稳定错误收束为用户可扫描的一行反馈。 */
 function retryResultMessage(result: RetryResult): string {
   const category = retryResultCategory(result)
-  if (category === 'conflict') return `选项冲突${result.error ? `：${result.error}` : ''}`
-  if (category === 'failed') return `提交失败${result.error ? `：${result.error}` : ''}`
-  if (category === 'reused') return '已复用处理任务'
+  if (category === 'processing_active') return `正在处理${result.reason || result.error ? `：${result.reason || result.error}` : ''}`
+  if (category === 'not_needed') return `无需修复${result.reason || result.error ? `：${result.reason || result.error}` : ''}`
+  if (category === 'failed') return `提交失败${result.error || result.reason ? `：${result.error || result.reason}` : ''}`
   return `已提交处理任务${showTaskDiagnostics && result.processing_job_id ? `（${result.processing_job_id}）` : ''}`
 }
 
@@ -284,10 +293,16 @@ async function submitSelectedRetry(submission: SelectedRetrySubmission, options?
         reverse_image_policy: options.reverse_image_policy,
         auto_name: options.auto_name,
       })
-      const results = Array.isArray(response.results) ? response.results : []
-      const queued = results.filter((item: { task_id?: string }) => item.task_id).length
-      const failed = results.filter((item: { error?: unknown }) => item.error).length
-      retryNotice.value = `重试选中：已提交 ${queued} 个完整任务${failed ? `，${failed} 项未提交` : ''}`
+      const results = (Array.isArray(response.results) ? response.results : []) as RetryResult[]
+      retryDetails.value = results
+      const counts = results.reduce(
+        (summary, item) => {
+          summary[retryResultCategory(item)] += 1
+          return summary
+        },
+        { submitted: 0, processing_active: 0, not_needed: 0, failed: 0 },
+      )
+      retryNotice.value = `重试选中：提交 ${counts.submitted} 个完整任务，处理中 ${counts.processing_active}，无需修复 ${counts.not_needed}，失败 ${counts.failed}`
     } else {
       const payload: Record<string, unknown> = { items: submission.items, stages: submission.stages }
       if (options) {
@@ -387,7 +402,7 @@ async function confirmUnreadyOptions(options: ImageProcessingOptions): Promise<v
   try {
     const response = await submitUnreadyProcessing(options) as UnreadyProcessingResponse
     retryDetails.value = response.results || []
-    retryNotice.value = `完整重试：目标 ${response.target_count ?? 0}，提交 ${response.submitted_count ?? 0}，复用 ${response.reused_count ?? 0}，冲突 ${response.conflict_count ?? 0}，失败 ${response.failed_count ?? 0}`
+    retryNotice.value = `修复未就绪：目标 ${response.target_count ?? 0}，提交 ${response.submitted_count ?? 0}，处理中 ${response.conflict_count ?? 0}，无需修复 ${response.not_needed_count ?? 0}，失败 ${response.failed_count ?? 0}`
     processingOptionsOpen.value = false
     processingOptionsTarget.value = null
     // 请求已经返回后关闭本次确认；下一次打开不得继承可能更高风险的选择。
@@ -459,7 +474,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
           重试选中<span v-if="selectedCount">（{{ selectedCount }}）</span>
         </button>
         <button class="primary toolbar-primary" type="button" :disabled="retryBusy" @click="openUnreadyOptions">
-          {{ retryBusy ? '提交中...' : '完整重试所有未就绪' }}
+          {{ retryBusy ? '提交中...' : '修复所有未就绪' }}
         </button>
         <button
           class="primary toolbar-primary cache-action"
@@ -479,7 +494,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
       </div>
     </div>
     <div v-if="retryNotice" class="inline-notice" role="status">{{ retryNotice }}</div>
-    <ul v-if="retryDetails.length" class="processing-result-details" aria-label="完整重试逐图结果">
+    <ul v-if="retryDetails.length" class="processing-result-details" aria-label="图片处理逐图结果">
       <li v-for="result in retryDetails" :key="result.meme_id" :class="retryResultCategory(result)">
         <strong v-if="showTaskDiagnostics">{{ result.meme_id }}</strong>
         <span>{{ retryResultMessage(result) }}</span>
@@ -562,6 +577,7 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
     :reverse-image-reason="props.config ? '反向图片服务不可用' : '服务状态未知'"
     :busy="retryBusy"
     :return-focus="processingOptionsTrigger"
+    :processing-target="processingOptionsTarget === 'unready' ? 'repair' : 'full_retry'"
     :initial-options="processingOptionsTarget === 'selected'
       ? (preserveSelectedRetryOptions ? selectedRetryOptions : undefined)
       : (preserveRetryOptions ? retryOptions : undefined)"

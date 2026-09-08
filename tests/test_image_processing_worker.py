@@ -300,6 +300,153 @@ def test_processing_options_use_safe_defaults_but_reject_explicit_empty_values()
         normalize_auto_name("false")
 
 
+def _run_fixed_plan_worker(
+    stages: list[dict[str, object]],
+    *,
+    child: SimpleNamespace | None = None,
+    target_valid: bool = True,
+    stage_valid: object = True,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
+    """用最小控制面替身运行一次 Worker，返回阶段写回、失效和新建记录。"""
+    job = SimpleNamespace(
+        id=uuid4(),
+        status="queued",
+        lease_owner=None,
+        lease_expires_at=None,
+        claim_generation=1,
+        auto_name=True,
+        image_sha256="a" * 64,
+        reverse_image_policy="forbid",
+        meme_id=uuid4(),
+        processing_config={},
+    )
+    transitions: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+    prepared: list[str] = []
+
+    class Jobs:
+        """提供单次 Worker reconcile 所需的父 Job 控制面。"""
+
+        def get(self, _job_id: str):
+            """返回待认领 Job。"""
+            return job
+
+        def claim(self, _job_id: str, *, owner: str):
+            """模拟成功认领并保留当前 generation。"""
+            del owner
+            job.status = "running"
+            job.lease_owner = "test-owner"
+            return job
+
+        def snapshot(self, _job_id: object):
+            """返回创建时已经冻结的阶段计划。"""
+            return SimpleNamespace(stages=stages)
+
+        def transition(self, _job_id: object, _stage: str, **kwargs: object):
+            """记录阶段状态写回。"""
+            transitions.append(kwargs)
+            return True
+
+        def fail_job(self, _job_id: object, **kwargs: object):
+            """记录固定计划失效收束。"""
+            failures.append(kwargs)
+            return True
+
+    resolved_child = child or SimpleNamespace(status="queued", error=None, payload={})
+
+    class Tasks:
+        """返回已经存在或新建的叶子 Task。"""
+
+        def get(self, _task_id: str):
+            """返回叶子 Task 快照。"""
+            return resolved_child
+
+    worker = ImageProcessingWorker(object(), scope_id="local", task_service=Tasks(), handlers={})
+    worker.owner = "test-owner"
+    worker.jobs = Jobs()
+    worker._target_valid = lambda _job: target_valid
+    worker._stage_valid = lambda _job, stage: stage_valid(stage) if callable(stage_valid) else bool(stage_valid)
+
+    def prepare(_job: object, stage: str) -> str:
+        """记录新叶子 Task 创建。"""
+        prepared.append(stage)
+        return "new-leaf"
+
+    worker._prepare_task = prepare
+    try:
+        worker._run(str(job.id))
+    finally:
+        worker.shutdown()
+    return transitions, failures, prepared
+
+
+def test_worker_runs_planned_stage_even_when_existing_result_is_valid() -> None:
+    """计划内阶段不能因为旧产物有效而被 Worker 运行时跳过。"""
+    transitions, failures, prepared = _run_fixed_plan_worker(
+        [
+            {"stage": "visual", "status": "queued", "planned": True, "skip_reason": None, "task_id": None},
+            {"stage": "agent", "status": "skipped", "planned": False, "skip_reason": "already_ready", "task_id": None},
+            {"stage": "auto_rename", "status": "skipped", "planned": False, "skip_reason": "disabled", "task_id": None},
+            {"stage": "text_embedding", "status": "skipped", "planned": False, "skip_reason": "already_ready", "task_id": None},
+        ],
+        stage_valid=lambda stage: stage != "visual",
+    )
+    assert prepared == ["visual"]
+    assert failures == []
+    assert transitions[-1]["status"] == "running"
+
+
+def test_worker_stops_when_skip_evidence_becomes_stale() -> None:
+    """跳过阶段的创建时依据失效时，Worker 返回固定计划失效。"""
+    transitions, failures, prepared = _run_fixed_plan_worker(
+        [
+            {"stage": "visual", "status": "skipped", "planned": False, "skip_reason": "already_ready", "task_id": None},
+            {"stage": "agent", "status": "queued", "planned": True, "skip_reason": None, "task_id": None},
+            {"stage": "auto_rename", "status": "skipped", "planned": False, "skip_reason": "disabled", "task_id": None},
+            {"stage": "text_embedding", "status": "skipped", "planned": False, "skip_reason": "already_ready", "task_id": None},
+        ],
+        stage_valid=False,
+    )
+    assert prepared == []
+    assert transitions == []
+    assert failures and failures[0]["error"] == {"error": "image_processing_plan_stale"}
+
+
+def test_worker_reuses_existing_planned_leaf_after_restart() -> None:
+    """重启恢复时已经绑定的活动叶子 Task 不会重复创建。"""
+    transitions, failures, prepared = _run_fixed_plan_worker(
+        [
+            {"stage": "visual", "status": "queued", "planned": True, "skip_reason": None, "task_id": "existing-leaf"},
+            {"stage": "agent", "status": "skipped", "planned": False, "skip_reason": "already_ready", "task_id": None},
+            {"stage": "auto_rename", "status": "skipped", "planned": False, "skip_reason": "disabled", "task_id": None},
+            {"stage": "text_embedding", "status": "skipped", "planned": False, "skip_reason": "already_ready", "task_id": None},
+        ],
+        child=SimpleNamespace(status="queued", error=None, payload={}),
+        stage_valid=lambda stage: stage != "visual",
+    )
+    assert prepared == []
+    assert failures == []
+    assert transitions[-1]["status"] == "running"
+
+
+def test_worker_rejects_changed_target_before_creating_leaf() -> None:
+    """计划内阶段执行前发现图片目标变化时停止并报告目标错误。"""
+    transitions, failures, prepared = _run_fixed_plan_worker(
+        [
+            {"stage": "visual", "status": "queued", "planned": True, "skip_reason": None, "task_id": None},
+            {"stage": "agent", "status": "skipped", "planned": False, "skip_reason": "already_ready", "task_id": None},
+            {"stage": "auto_rename", "status": "skipped", "planned": False, "skip_reason": "disabled", "task_id": None},
+            {"stage": "text_embedding", "status": "skipped", "planned": False, "skip_reason": "already_ready", "task_id": None},
+        ],
+        target_valid=False,
+        stage_valid=True,
+    )
+    assert prepared == []
+    assert failures == []
+    assert transitions[-1]["status"] == "failed"
+    assert transitions[-1]["error"] == {"error": "target_changed"}
+
+
 def test_stage_valid_releases_database_session_before_file_check(monkeypatch: pytest.MonkeyPatch) -> None:
     """阶段复用检查必须在数据库 Session 退出后才解析 BlobStore 和读取文件。"""
     meme = SimpleNamespace(

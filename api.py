@@ -42,6 +42,7 @@ from backend.collection_packages import (
     sha256_bytes,
 )
 from backend.image_safety import ImagePreflightError, validate_image_content
+from backend.image_naming import normalize_display_name, saved_filename
 from backend.errors import ErrorBody
 from backend.metadata import MetadataError
 from backend.database import DatabaseError, DatabaseResources, Meme, MemeTextEmbedding, ScopeContext, check_database, create_engine_for_settings, utcnow
@@ -1008,12 +1009,13 @@ async def lifespan(app: FastAPI):
         expected_sha = payload.get("image_sha256")
         expected_storage_key = payload.get("expected_storage_key")
         expected_revision = payload.get("expected_meme_revision")
+        expected_display_name = payload.get("expected_display_name")
         expected_title_fingerprint = payload.get("title_fingerprint")
         claim_task_id = payload.get("_claim_task_id")
         claim_generation = payload.get("_claim_generation")
         claim_attempt = payload.get("_claim_attempt")
         claim_owner = payload.get("_claim_owner")
-        if not all(isinstance(value, str) and value for value in (meme_id, expected_sha, expected_storage_key, expected_title_fingerprint, claim_task_id, claim_owner)) or not isinstance(expected_revision, int) or not isinstance(claim_generation, int) or not isinstance(claim_attempt, int):
+        if not all(isinstance(value, str) and value for value in (meme_id, expected_sha, expected_storage_key, expected_title_fingerprint, claim_task_id, claim_owner)) or (expected_display_name is not None and (not isinstance(expected_display_name, str) or not expected_display_name)) or not isinstance(expected_revision, int) or not isinstance(claim_generation, int) or not isinstance(claim_attempt, int):
             raise RuntimeError("auto_rename_claim_expired")
         try:
             record, image = service.metadata.image_for_meme(meme_id)
@@ -1044,14 +1046,16 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("target_changed")
         try:
             target_name = _filename_from_title(title, image.suffix or record.extension)
+            target_display_name = normalize_display_name(Path(target_name).stem)
         except ValueError as exc:
             raise RuntimeError("auto_rename_invalid_filename") from exc
-        target = image.with_name(target_name)
-        same_name = target == image
+        same_name = record.display_name == target_display_name
         try:
             renamed = service.metadata.storage.rename_if_current(
                 record.id,
-                target_key=service.metadata.blob_store.relative(target),
+                # ``target_key`` 保留协调器的兼容参数形状；它现在只承载展示名和
+                # 扩展名，不对应要移动的物理文件。
+                target_key=target_name,
                 expected_source_key=expected_storage_key,
                 expected_sha256=expected_sha,
                 expected_revision=expected_revision,
@@ -1060,6 +1064,7 @@ async def lifespan(app: FastAPI):
                 attempt=claim_attempt,
                 claim_owner=claim_owner,
                 expected_title_fingerprint=expected_title_fingerprint,
+                expected_display_name=expected_display_name,
             )
         except DatabaseError as exc:
             if exc.code == "target_exists":
@@ -1069,6 +1074,8 @@ async def lifespan(app: FastAPI):
                 # 必须停止 Job，不能伪装成可恢复 warning。
                 raise RuntimeError("target_changed") from exc
             if exc.code == "storage_key_changed":
+                raise RuntimeError("auto_rename_target_changed") from exc
+            if exc.code == "display_name_changed":
                 raise RuntimeError("auto_rename_target_changed") from exc
             if exc.code == "claim_expired":
                 raise RuntimeError("auto_rename_claim_expired") from exc
@@ -1084,8 +1091,8 @@ async def lifespan(app: FastAPI):
             # ``None`` 当作普通命名失败或让任务服务退化成 task_failed。
             raise RuntimeError("auto_rename_unknown_execution")
         if payload.get("submission_mode") == "standalone":
-            # 重命名改变 sidecar image.relative_path，独立阶段不创建文本 Task，
-            # 但必须让重命名前绑定旧路径的 ready 向量退出检索候选。
+            # 独立阶段不创建文本 Task；保留一次 hash 复核，使旧运行时向量不会在
+            # 语境读取异常时继续作为成功事实暴露。
             metadata_hash = ImageProcessingWorker._metadata_hash(renamed)
             if metadata_hash is None:
                 raise RuntimeError("auto_rename_unknown_execution")
@@ -1099,10 +1106,14 @@ async def lifespan(app: FastAPI):
         if progress:
             progress(1.0, "文件名已经符合标题" if same_name else "自动重命名已完成")
         if not same_name:
-            # 独立重命名改变了 storage_key，当前 scope 的检索缓存不能继续
-            # 使用旧 metadata hash；任务 handler 只能通过已解析的 service 失效缓存。
+            # 展示名改变后图片列表和依赖它的内存缓存需要重新读取当前记录；物理
+            # storage_key 与内容 hash 在此阶段保持不变。
             service.search.invalidate_cache()
-        return {"meme_id": meme_id, "saved_filename": renamed.storage_key.rsplit("/", 1)[-1], "auto_named": not same_name}
+        try:
+            public_filename = saved_filename(renamed.display_name, renamed.extension)
+        except (AttributeError, TypeError, ValueError):
+            public_filename = saved_filename(target_display_name, record.extension)
+        return {"meme_id": meme_id, "saved_filename": public_filename, "auto_named": not same_name}
 
     def text_embedding_handler(payload: dict[str, object], progress):
         """为统一图片处理 job 的当前语境生成单图文本向量。"""
@@ -1308,7 +1319,7 @@ def _processing_repository(request: Request) -> ImageProcessingRepository:
     return ImageProcessingRepository(request.app.state.database, _request_scope(request))
 
 
-def _submit_processing_job_for_image(request: Request, record: Meme, image: Path, *, reverse_image_policy: object = None, auto_name: object = None, explicit_retry: bool = False, schedule: bool = True) -> ImageProcessingSnapshot:
+def _submit_processing_job_for_image(request: Request, record: Meme, image: Path, *, reverse_image_policy: object = None, auto_name: object = None, processing_mode: str = "normal", explicit_retry: bool = False, schedule: bool = True) -> ImageProcessingSnapshot:
     """把旧单阶段入口收敛到当前 scope 的统一图片处理 job。"""
     worker = _processing_worker(request)
     if worker is None:
@@ -1322,6 +1333,7 @@ def _submit_processing_job_for_image(request: Request, record: Meme, image: Path
         config=_processing_config(request),
         reverse_image_policy=options.reverse_image_policy,
         auto_name=options.auto_name,
+        processing_mode=processing_mode,
         # 上传/普通单图提交只创建或复用当前 revision；终态失败只能通过显式
         # retry 接口或图片库批量入口创建新 revision，避免请求重试隐式重放外部执行。
         explicit_retry=explicit_retry,
@@ -1589,11 +1601,23 @@ async def get_image_processing_job(request: Request, job_id: str) -> dict[str, o
     )
 
 
-def _core_image_ready(request: Request, record: Meme, image: Path, policy: str) -> bool:
+def _core_image_ready(request: Request, record: Meme, image: Path, policy: str, *, auto_name: bool = False) -> bool:
     """按当前图片、Agent 策略和文本模型判断三个核心产物是否有效。"""
     del image  # 物理身份由共享判定按当前 storage_key 重新解析并复核。
-    latest = _processing_repository(request).latest_for_target(record.id, record.sha256)
+    processing_repository = _processing_repository(request)
+    latest = processing_repository.latest_for_target(record.id, record.sha256)
+    active_task_check = getattr(processing_repository, "has_active_image_task", None)
+    if callable(active_task_check) and active_task_check(record.id, record.sha256):
+        return False
+    if auto_name and latest is None:
+        # 没有父 Job 历史就没有可证明的自动命名结果；即使三个核心产物存在，
+        # 本次启用的自动命名仍必须进入修复计划。
+        return False
     if latest is not None:
+        # 活动父 Job/独立阶段不能被核心产物就绪判断吞掉；后续提交事务仍会在
+        # 图片锁内复核并返回 image_processing_active，批量结果才能逐图显示冲突。
+        if latest.status in {"queued", "running"}:
+            return False
         if latest.reverse_image_policy != policy:
             return False
         # 产物可能仍然存在，但最新 Job/核心阶段已明确失败、阻止或执行状态
@@ -1616,11 +1640,28 @@ def _core_image_ready(request: Request, record: Meme, image: Path, policy: str) 
             warning_code = (auto_rename_stage.get("error") or {}).get("error") if isinstance(auto_rename_stage.get("error"), Mapping) else None
             if warning_code not in AUTO_RENAME_WARNING_ERRORS:
                 return False
-        if any(
-            next((stage.get("status") for stage in latest.stages if stage.get("stage") == required), None) != "succeeded"
-            for required in ("visual", "agent", "text_embedding")
+            if auto_name:
+                return False
+        if auto_name and (
+            auto_rename_stage is None
+            or not (
+                auto_rename_stage.get("status") == "succeeded"
+                or (
+                    auto_rename_stage.get("status") == "skipped"
+                    and auto_rename_stage.get("skip_reason") == "already_ready"
+                )
+            )
         ):
+            # 本次启用自动命名时，历史上未启用或未完成该阶段的图片仍需进入
+            # 修复计划；不能只因三个核心产物齐全就把可选阶段吞掉。
             return False
+        for required in ("visual", "agent", "text_embedding"):
+            stage = next((stage for stage in latest.stages if stage.get("stage") == required), None)
+            if stage is None or not (
+                stage.get("status") == "succeeded"
+                or (stage.get("status") == "skipped" and stage.get("skip_reason") == "already_ready")
+            ):
+                return False
     config = _processing_config(request)
     if not image_file_matches(request.app.state.database, _request_scope(request), record):
         return False
@@ -1675,7 +1716,6 @@ async def process_unready_image_library(request: Request, payload: ProcessingBat
     worker = _processing_worker(request)
     if worker is None:
         raise _error(503, "image_processing_unavailable", "图片处理服务当前不可用")
-    repository = _processing_repository(request)
     results: list[dict[str, object]] = []
     last_id: UUID | None = None
     while True:
@@ -1692,9 +1732,15 @@ async def process_unready_image_library(request: Request, payload: ProcessingBat
             last_id = meme.id
             try:
                 image = _service(request, "metadata").blob_store.resolve(meme.storage_key)
-                if _core_image_ready(request, meme, image, options.reverse_image_policy):
+                if _core_image_ready(request, meme, image, options.reverse_image_policy, auto_name=options.auto_name):
+                    results.append(
+                        {
+                            "meme_id": str(meme.id),
+                            "reason": "already_ready",
+                            "category": "not_needed",
+                        }
+                    )
                     continue
-                latest = repository.latest_for_target(meme.id, meme.sha256)
                 snapshot = worker.submit(
                     meme.id,
                     meme.sha256,
@@ -1702,29 +1748,30 @@ async def process_unready_image_library(request: Request, payload: ProcessingBat
                     config=_processing_config(request),
                     reverse_image_policy=options.reverse_image_policy,
                     auto_name=options.auto_name,
-                    explicit_retry=latest is not None,
+                    processing_mode="repair",
                     schedule=True,
                 )
-                reused = latest is not None and latest.job_id == snapshot.job_id
                 results.append(
                     {
                         "meme_id": str(meme.id),
                         "processing_job_id": snapshot.job_id,
-                        "status": snapshot.status,
-                        "reused": reused,
-                        "category": "reused" if reused else "submitted",
+                        "category": "submitted",
                     }
                 )
             except ImageProcessingError as exc:
-                category = "conflict" if exc.code in {"generation_policy_conflict", "processing_options_conflict"} else "failed"
-                results.append({"meme_id": str(meme.id), "error": exc.code, "category": category})
+                if exc.code == "image_processing_active":
+                    results.append({"meme_id": str(meme.id), "reason": exc.code, "category": "processing_active"})
+                elif exc.code == "already_ready":
+                    results.append({"meme_id": str(meme.id), "reason": "already_ready", "category": "not_needed"})
+                else:
+                    results.append({"meme_id": str(meme.id), "reason": exc.code, "category": "failed"})
             except Exception:  # noqa: BLE001 - 单图提交必须隔离异常并继续枚举其它图片
-                results.append({"meme_id": str(meme.id), "error": "image_processing_failed", "category": "failed"})
-    submitted = sum(1 for item in results if item.get("processing_job_id") and not item.get("reused"))
-    reused = sum(1 for item in results if item.get("reused"))
-    conflicts = sum(1 for item in results if item.get("category") == "conflict")
+                results.append({"meme_id": str(meme.id), "error": "image_processing_failed", "reason": "image_processing_failed", "category": "failed"})
+    submitted = sum(1 for item in results if item.get("category") == "submitted")
+    conflicts = sum(1 for item in results if item.get("category") == "processing_active")
+    not_needed = sum(1 for item in results if item.get("category") == "not_needed")
     failed = sum(1 for item in results if item.get("category") == "failed")
-    return {"target_count": len(results), "submitted_count": submitted, "reused_count": reused, "conflict_count": conflicts, "failed_count": failed, "results": results}
+    return {"target_count": len(results), "submitted_count": submitted, "reused_count": 0, "conflict_count": conflicts, "not_needed_count": not_needed, "failed_count": failed, "results": results}
 
 
 @app.post("/image-processing/{job_id}/retry", status_code=202, tags=["images", "tasks"], include_in_schema=False)

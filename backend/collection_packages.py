@@ -24,6 +24,7 @@ from typing import Any, Mapping, Sequence
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
 
 from backend.database import BlobStore, DatabaseError
+from backend.image_naming import is_content_addressed_key, public_filename_fields, saved_filename
 from backend.image_safety import ImagePreflightError, validate_image_content
 from backend.paths import SUPPORTED_EXTENSIONS, validate_business_storage_key
 
@@ -443,20 +444,52 @@ def preflight_archive(content: bytes, *, max_file_size: int = DEFAULT_MAX_FILE_S
         return ValidatedCollectionPackage(manifest=manifest, members=tuple(validated))
 
 
-def resolve_import_filename(filename: str, sha256: str, existing: Mapping[str, Any]) -> ImportTarget:
-    """按同名同 SHA 复用、同名异 SHA 哈希后缀规则解析导入文件名。"""
+def _existing_saved_filename(value: Any, fallback: str) -> str:
+    """从现有 Meme 记录投影公开文件名，兼容旧测试 facade 的简单对象。"""
+    record = value.get("meme") if isinstance(value, Mapping) else value
+    display_name = getattr(record, "display_name", None)
+    extension = getattr(record, "extension", None)
+    if isinstance(value, Mapping):
+        display_name = value.get("display_name", display_name)
+        extension = value.get("extension", extension)
+    if isinstance(display_name, str) and isinstance(extension, str):
+        try:
+            return saved_filename(display_name, extension)
+        except ValueError:
+            pass
+    sha256 = value.get("sha256") if isinstance(value, Mapping) else getattr(record, "sha256", None)
+    if is_content_addressed_key(fallback, sha256, extension):
+        raise _package_error("member_changed")
+    return fallback
+
+
+def resolve_import_filename(
+    filename: str,
+    sha256: str,
+    existing: Mapping[str, Any],
+    existing_by_content: Mapping[tuple[str, str], Any] | None = None,
+) -> ImportTarget:
+    """按内容身份优先复用 Meme，再处理展示名冲突和哈希后缀。"""
     clean = normalize_package_filename(filename)
+    extension = Path(clean).suffix.lower()
+    if not isinstance(sha256, str) or _SHA256_RE.fullmatch(sha256.lower()) is None:
+        raise _package_error("invalid_sha256")
+    normalized_sha = sha256.lower()
+    if existing_by_content is not None:
+        content_match = existing_by_content.get((normalized_sha, extension))
+        if content_match is not None:
+            return ImportTarget(_existing_saved_filename(content_match, clean), content_match.get("meme") if isinstance(content_match, Mapping) else content_match)
     current = existing.get(clean)
     if current is None:
         return ImportTarget(clean)
     current_meme = current.get("meme") if isinstance(current, Mapping) else current
     current_sha = current.get("sha256") if isinstance(current, Mapping) else getattr(current, "sha256", None)
-    if str(current_sha) == sha256:
-        return ImportTarget(clean, current_meme)
+    if str(current_sha).lower() == normalized_sha:
+        return ImportTarget(_existing_saved_filename(current, clean), current_meme)
     stem = Path(clean).stem
-    suffix = Path(clean).suffix.lower()
+    suffix = extension
     for prefix_length in range(8, 65, 8):
-        candidate = f"{stem}-{sha256[:prefix_length]}{suffix}"
+        candidate = f"{stem}-{normalized_sha[:prefix_length]}{suffix}"
         try:
             normalize_package_filename(candidate, suffix)
         except CollectionPackageError:
@@ -466,8 +499,8 @@ def resolve_import_filename(filename: str, sha256: str, existing: Mapping[str, A
             return ImportTarget(candidate)
         other_meme = other.get("meme") if isinstance(other, Mapping) else other
         other_sha = other.get("sha256") if isinstance(other, Mapping) else getattr(other, "sha256", None)
-        if str(other_sha) == sha256:
-            return ImportTarget(candidate, other_meme)
+        if str(other_sha).lower() == normalized_sha:
+            return ImportTarget(_existing_saved_filename(other, candidate), other_meme)
     raise _package_error("filename_conflict")
 
 
@@ -490,6 +523,18 @@ def _read_export_member(member: Any, blob_store: BlobStore, *, max_file_size: in
     if total_size + len(content) > max_total_size:
         raise _package_error("package_too_large")
     return content, total_size + len(content)
+
+
+def _export_filename(member: Any, extension: str) -> str:
+    """从 Meme 展示字段生成 manifest 文件名，禁止导出内容寻址物理 key。"""
+    try:
+        return normalize_package_filename(public_filename_fields(member)["filename"], extension)
+    except ValueError:
+        legacy = normalize_package_filename(str(member.storage_key), extension)
+        if is_content_addressed_key(legacy, getattr(member, "sha256", None), extension):
+            raise _package_error("member_changed")
+        # 旧 facade 的人类文件名仍可导出；生产 ORM 行始终走展示字段分支。
+        return legacy
 
 
 def build_export_archive(collection_name: str, members: Sequence[Any], blob_store: BlobStore, *, temp_root: Path, max_file_size: int = DEFAULT_MAX_FILE_SIZE, max_total_size: int = MAX_TOTAL_UNCOMPRESSED_BYTES, max_archive_size: int = MAX_ARCHIVE_COMPRESSED_BYTES) -> Path:
@@ -516,7 +561,7 @@ def build_export_archive(collection_name: str, members: Sequence[Any], blob_stor
                 if extension not in SUPPORTED_EXTENSIONS:
                     raise _package_error("unsupported_format")
                 path = f"{IMAGE_ROOT}/{member.id}{extension}"
-                filename = normalize_package_filename(str(member.storage_key), extension)
+                filename = _export_filename(member, extension)
                 manifest_members.append(CollectionManifestMember(source_meme_id=str(member.id), filename_at_export=filename, path=path, extension=extension, size_bytes=len(content), sha256=sha256_bytes(content)))
                 image_entries.append((path, content))
             manifest = CollectionManifest(format=PACKAGE_FORMAT, format_version=PACKAGE_VERSION, collection=CollectionManifestCollection(name=normalize_collection_name(collection_name)), members=manifest_members)

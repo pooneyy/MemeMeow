@@ -110,7 +110,16 @@ class DatabaseResources:
     def search_rebuild_preflight(self, scope_id: str | ScopeContext | None = None) -> dict[str, Any]:
         """返回检索重建门禁；结构性问题阻断，原图缺失或指纹漂移仅报告。"""
         report = self.flat_preflight(scope_id)
-        structural_keys = ("non_flat_keys", "nested_images", "active_operations")
+        structural_keys = (
+            "non_flat_keys",
+            "invalid_sha256",
+            "invalid_extensions",
+            "invalid_display_names",
+            "non_content_addressed_keys",
+            "duplicate_content",
+            "nested_images",
+            "active_operations",
+        )
         report["blocking"] = any(bool(report.get(key)) for key in structural_keys)
         report["blocking_keys"] = [key for key in structural_keys if report.get(key)]
         return report

@@ -274,6 +274,59 @@ def test_collection_import_reuses_identity_checked_meme_without_operation(monkey
     assert "invalidate" not in events
 
 
+def test_collection_import_reuses_content_identity_without_exposing_content_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """合集导入按 SHA 和扩展名复用既有 Meme，响应只返回公开展示文件名。"""
+    collection = SimpleNamespace(id=uuid4())
+    digest = "a" * 64
+    existing = SimpleNamespace(
+        id=uuid4(),
+        storage_key=f"{digest}.png",
+        display_name="旧名称",
+        extension=".png",
+        sha256=digest,
+        size_bytes=9,
+    )
+    environment = _Environment(_Collections(collection), [existing])
+    events: list[object] = []
+    metadata = SimpleNamespace(
+        blob_store=SimpleNamespace(exists_with_identity=lambda *_args, **_kwargs: True),
+        upload_bytes=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("same content must reuse")),
+    )
+
+    result, _upload = _call_import(monkeypatch, package=_package(filename="新名称.png"), environment=environment, events=events, metadata=metadata)
+
+    item = result["results"][0]
+    assert item["status"] == "reused"
+    assert item["target_meme_id"] == str(existing.id)
+    assert item["saved_filename"] == "旧名称.png"
+    assert digest not in str(result)
+    assert not any(isinstance(event, tuple) and event[0] == "acquire" for event in events)
+
+
+def test_collection_import_failure_omits_content_key_filename(monkeypatch: pytest.MonkeyPatch) -> None:
+    """导入失败时即使旧 manifest 使用 hash 文件名，响应也不能回显物理 key。"""
+    collection = SimpleNamespace(id=uuid4())
+    digest = "a" * 64
+    environment = _Environment(_Collections(collection), [])
+    metadata = SimpleNamespace(
+        blob_store=SimpleNamespace(exists_with_identity=lambda *_args, **_kwargs: False),
+        upload_bytes=lambda *_args, **_kwargs: (_ for _ in ()).throw(MetadataError("staging_conflict")),
+    )
+
+    result, _upload = _call_import(
+        monkeypatch,
+        package=_package(filename=f"{digest}.png", sha256=digest),
+        environment=environment,
+        events=[],
+        metadata=metadata,
+    )
+
+    item = result["results"][0]
+    assert item["error"] == "staging_conflict"
+    assert "filename" not in item
+    assert digest not in str(result)
+
+
 @pytest.mark.parametrize("reused", [False, True])
 def test_collection_import_enqueues_thumbnail_for_imported_and_reused_meme(monkeypatch: pytest.MonkeyPatch, reused: bool) -> None:
     """新导入和同名复用都必须走同一个幂等缩略图 enqueue callback。"""

@@ -669,12 +669,12 @@ def test_task_success_and_failure_keep_terminal_audit_and_provenance(postgres_re
     try:
         succeeded = _wait_terminal(worker, success_task.task_id)
         assert succeeded.status == "succeeded"
-        assert succeeded.result["reverse_image"]["outcome"] == "success"
-        assert succeeded.result["reverse_image"]["provider_calls"] == 1
+        assert succeeded.result["network_reverse_image_search"]["outcome"] == "success"
+        assert succeeded.result["network_reverse_image_search"]["provider_calls"] == 1
         with resources.environment("local") as environment:
             stored = environment.memes.get(meme.id)
             assert stored is not None
-            assert stored.provenance["reverse_image"]["outcome"] == "success"
+            assert stored.provenance["network_reverse_image_search"]["outcome"] == "success"
         assert success_calls == [1]
     finally:
         worker.shutdown()
@@ -696,13 +696,13 @@ def test_task_success_and_failure_keep_terminal_audit_and_provenance(postgres_re
     try:
         failed = _wait_terminal(failing_worker, failed_task.task_id)
         assert failed.status == "failed"
-        assert failed.result["reverse_image"]["outcome"] == "failed"
-        assert failed.result["reverse_image"]["provider_calls"] == 1
+        assert failed.result["network_reverse_image_search"]["outcome"] == "failed"
+        assert failed.result["network_reverse_image_search"]["provider_calls"] == 1
         with resources.environment("local") as environment:
             stored = environment.memes.get(meme.id)
             assert stored is not None
-            assert "reverse_image" in stored.provenance
-            assert stored.provenance["reverse_image"]["outcome"] == "success"
+            assert "network_reverse_image_search" in stored.provenance
+            assert stored.provenance["network_reverse_image_search"]["outcome"] == "success"
     finally:
         failing_worker.shutdown()
 

@@ -147,6 +147,84 @@ class DerivedThumbnailRepository:
             self.session.flush()
         return current
 
+    def ensure_pending_many(self, memes: Iterable[Meme], profile: str) -> dict[UUID, DerivedImageThumbnail]:
+        """在一个短事务中批量补齐当前页缺失的 pending 事实。
+
+        输入是当前列表页的 Meme 快照，返回仅包含仍存在于当前 scope 的事实。父
+        Meme 按稳定 ID 一次锁定，随后批量读取该页所有 profile 行；这样并发列表
+        请求会在同一父行上串行化，避免逐图查询和首次插入的唯一键竞态。已有
+        failed/stale 当前版本只保留，不因列表访问而重置。
+        """
+        values = list(memes)
+        identifiers = tuple(
+            dict.fromkeys(
+                item.id
+                for item in values
+                if isinstance(getattr(item, "id", None), UUID)
+            )
+        )
+        if not identifiers:
+            return {}
+        authoritative = list(
+            self.session.scalars(
+                select(Meme)
+                .where(
+                    Meme.scope_id == self.scope.scope_id,
+                    Meme.id.in_(identifiers),
+                )
+                .order_by(Meme.id.asc())
+                .with_for_update()
+            )
+        )
+        if not authoritative:
+            return {}
+        rows = list(
+            self.session.scalars(
+                select(DerivedImageThumbnail)
+                .where(
+                    DerivedImageThumbnail.scope_id == self.scope.scope_id,
+                    DerivedImageThumbnail.meme_id.in_(tuple(item.id for item in authoritative)),
+                    DerivedImageThumbnail.profile == profile,
+                )
+                .with_for_update()
+            )
+        )
+        by_meme: dict[UUID, list[DerivedImageThumbnail]] = {}
+        for row in rows:
+            by_meme.setdefault(row.meme_id, []).append(row)
+        result: dict[UUID, DerivedImageThumbnail] = {}
+        pending: list[DerivedImageThumbnail] = []
+        for meme in authoritative:
+            source_sha256 = str(meme.sha256).lower()
+            source_size_bytes = meme.size_bytes
+            current: DerivedImageThumbnail | None = None
+            for row in by_meme.get(meme.id, []):
+                if (
+                    str(row.source_sha256).lower() == source_sha256
+                    and row.source_size_bytes == source_size_bytes
+                ):
+                    current = row
+                else:
+                    if row.status != "stale":
+                        row.status = "stale"
+                        row.diagnostic = {"error": "source_version_changed"}
+                        row.updated_at = utcnow()
+            if current is None:
+                current = DerivedImageThumbnail(
+                    scope_id=self.scope.scope_id,
+                    meme_id=meme.id,
+                    source_sha256=source_sha256,
+                    source_size_bytes=source_size_bytes,
+                    profile=profile,
+                    status="pending",
+                )
+                pending.append(current)
+            result[meme.id] = current
+        if pending:
+            self.session.add_all(pending)
+        self.session.flush()
+        return result
+
     def list_current(self, memes: Iterable[Meme], profile: str) -> dict[UUID, DerivedImageThumbnail]:
         """批量读取一页 Meme 的当前 profile 派生事实。"""
         values = list(memes)
