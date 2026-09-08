@@ -1601,92 +1601,51 @@ async def get_image_processing_job(request: Request, job_id: str) -> dict[str, o
     )
 
 
-def _core_image_ready(request: Request, record: Meme, image: Path, policy: str, *, auto_name: bool = False) -> bool:
-    """按当前图片、Agent 策略和文本模型判断三个核心产物是否有效。"""
+def _core_image_readiness(request: Request, record: Meme, image: Path, policy: str, *, auto_name: bool = False) -> dict[str, bool]:
+    """取得当前图片四个阶段的真实就绪快照，供批量修复固定执行范围。
+
+    返回值只包含阶段是否已经具备当前请求可用的结果；文件校验发生在数据库事务
+    外，数据库产物和最近 Job 阶段状态则在同一次短读取环境中核对。调用场景是
+    “修复所有未就绪”逐图提交，不能只返回一个总的 ready 布尔值。
+    """
     del image  # 物理身份由共享判定按当前 storage_key 重新解析并复核。
+    readiness = {"visual": False, "agent": False, "auto_rename": not auto_name, "text_embedding": False}
     processing_repository = _processing_repository(request)
     latest = processing_repository.latest_for_target(record.id, record.sha256)
     active_task_check = getattr(processing_repository, "has_active_image_task", None)
     if callable(active_task_check) and active_task_check(record.id, record.sha256):
-        return False
-    if auto_name and latest is None:
-        # 没有父 Job 历史就没有可证明的自动命名结果；即使三个核心产物存在，
-        # 本次启用的自动命名仍必须进入修复计划。
-        return False
-    if latest is not None:
-        # 活动父 Job/独立阶段不能被核心产物就绪判断吞掉；后续提交事务仍会在
-        # 图片锁内复核并返回 image_processing_active，批量结果才能逐图显示冲突。
-        if latest.status in {"queued", "running"}:
-            return False
-        if latest.reverse_image_policy != policy:
-            return False
-        # 产物可能仍然存在，但最新 Job/核心阶段已明确失败、阻止或执行状态
-        # 未知；完整重试必须把这种目标重新纳入，而不是只看三张产物表。
-        if latest.status in {"failed", "blocked", "unknown_execution"}:
-            return False
-        if any(
-            stage.get("stage") in {"visual", "agent", "text_embedding"}
-            and stage.get("status") in {"failed", "blocked", "unknown_execution"}
-            for stage in latest.stages
-        ):
-            return False
-        # 自动重命名 warning 是可选阶段的非阻塞结果，但目标/执行身份失效
-        # 仍会停止 Job；即使异常历史行的顶层状态没有同步，也不能把它当作
-        # 核心产物已经可以安全复用。
-        auto_rename_stage = next((stage for stage in latest.stages if stage.get("stage") == "auto_rename"), None)
-        if auto_rename_stage and auto_rename_stage.get("status") in {"failed", "blocked", "unknown_execution"}:
-            return False
-        if auto_rename_stage and auto_rename_stage.get("status") == "warning":
-            warning_code = (auto_rename_stage.get("error") or {}).get("error") if isinstance(auto_rename_stage.get("error"), Mapping) else None
-            if warning_code not in AUTO_RENAME_WARNING_ERRORS:
-                return False
-            if auto_name:
-                return False
-        if auto_name and (
-            auto_rename_stage is None
-            or not (
-                auto_rename_stage.get("status") == "succeeded"
-                or (
-                    auto_rename_stage.get("status") == "skipped"
-                    and auto_rename_stage.get("skip_reason") == "already_ready"
-                )
-            )
-        ):
-            # 本次启用自动命名时，历史上未启用或未完成该阶段的图片仍需进入
-            # 修复计划；不能只因三个核心产物齐全就把可选阶段吞掉。
-            return False
-        for required in ("visual", "agent", "text_embedding"):
-            stage = next((stage for stage in latest.stages if stage.get("stage") == required), None)
-            if stage is None or not (
-                stage.get("status") == "succeeded"
-                or (stage.get("status") == "skipped" and stage.get("skip_reason") == "already_ready")
-            ):
-                return False
-    config = _processing_config(request)
-    if not image_file_matches(request.app.state.database, _request_scope(request), record):
-        return False
-    metadata_hash = ImageProcessingWorker._metadata_hash(record)
-    if metadata_hash is None or record.context_status != "ready":
-        return False
-    summary = (record.provenance or {}).get("agent_context")
-    expected_config_hash = processing_config_hash(config)
-    if (
-        not isinstance(summary, Mapping)
-        or summary.get("image_sha256") != record.sha256
-        or summary.get("model") != config.get("agent_model")
-        or summary.get("reverse_image_policy") != policy
-        or summary.get("processing_config_hash") != expected_config_hash
-        or ("skill_hash" in config and summary.get("skill_hash") != config.get("skill_hash"))
-        or not summary.get("task_id")
-        or not summary.get("completed_at")
-    ):
-        return False
-    visual_identity = identity_from_settings(request.app.state.settings)
+        return readiness
+    if latest is not None and latest.status in {"queued", "running"}:
+        # 活动父 Job/独立阶段不能被核心产物就绪判断吞掉；提交事务会再次返回
+        # image_processing_active，批量结果才能逐图显示冲突。
+        return readiness
+
     try:
+        config = _processing_config(request)
+    except AttributeError:
+        # 轻量兼容调用没有完整 Request 生命周期；缺少配置时只能安全地按未就绪
+        # 返回，真实 HTTP 请求会在正常应用上下文中继续完成阶段核对。
+        return readiness
+    expected_config_hash = processing_config_hash(config)
+    if not image_file_matches(request.app.state.database, _request_scope(request), record):
+        return {stage: False for stage in readiness}
+    metadata_hash = ImageProcessingWorker._metadata_hash(record)
+    if metadata_hash is None:
+        return readiness
+
+    # 当前文件身份已确认，三个核心产物分别按当前配置和输入指纹核对，不能把
+    # 某一个缺失产物连带误判为其它阶段也已就绪。
+    try:
+        visual_identity = identity_from_settings(request.app.state.settings)
         with _environment(request) as environment:
-            visual = environment.visual.get(record.id, model=visual_identity.model, preprocess_version=visual_identity.preprocess_version, dimensions=visual_identity.dimensions, image_sha256=record.sha256)
-            if visual is None or visual.embedding is None:
-                return False
+            visual = environment.visual.get(
+                record.id,
+                model=visual_identity.model,
+                preprocess_version=visual_identity.preprocess_version,
+                dimensions=visual_identity.dimensions,
+                image_sha256=record.sha256,
+            )
+            readiness["visual"] = visual is not None and visual.embedding is not None
             text_row = environment.uow.session.scalar(
                 select(MemeTextEmbedding).where(
                     MemeTextEmbedding.scope_id == _request_scope(request).scope_id,
@@ -1699,9 +1658,84 @@ def _core_image_ready(request: Request, record: Meme, image: Path, policy: str, 
                     MemeTextEmbedding.embedding.is_not(None),
                 )
             )
-            return text_row is not None
+            readiness["text_embedding"] = text_row is not None
     except Exception:  # noqa: BLE001 - 就绪判断是安全边界，任一异常都必须 fail-closed
-        return False
+        return {stage: False for stage in readiness}
+
+    summary = (record.provenance or {}).get("agent_context")
+    readiness["agent"] = (
+        record.context_status == "ready"
+        and isinstance(summary, Mapping)
+        and summary.get("image_sha256") == record.sha256
+        and summary.get("model") == config.get("agent_model")
+        and summary.get("reverse_image_policy") == policy
+        and summary.get("processing_config_hash") == expected_config_hash
+        and ("skill_hash" not in config or summary.get("skill_hash") == config.get("skill_hash"))
+        and bool(summary.get("task_id") and summary.get("completed_at"))
+    )
+
+    if latest is None:
+        # 没有父 Job 历史就没有可证明的自动命名结果；核心产物仍可独立判断，
+        # 这样修复计划只会加入真正缺失的阶段和自动命名阶段。
+        readiness["auto_rename"] = not auto_name
+        return readiness
+
+    # 旧 Job 的选项事实仍是当前结果是否可复用的必要条件，但只影响对应阶段。
+    # 例如 Agent 失败不应把仍有效的视觉向量也伪装成缺失。
+    if latest.processing_config_hash != expected_config_hash:
+        readiness["visual"] = False
+        readiness["agent"] = False
+        readiness["text_embedding"] = False
+    if latest.reverse_image_policy != policy:
+        readiness["agent"] = False
+        readiness["text_embedding"] = False
+    if latest.metadata_hash != metadata_hash:
+        readiness["text_embedding"] = False
+
+    stages = {stage.get("stage"): stage for stage in latest.stages if isinstance(stage, Mapping)}
+    if latest.status in {"failed", "blocked", "unknown_execution"}:
+        # 顶层非成功终态可能来自目标、租约或计划错误，不能仅因旧阶段行偶然
+        # 保留 succeeded 就把整张图片报告为已修复。
+        readiness["visual"] = False
+        readiness["agent"] = False
+        readiness["text_embedding"] = False
+        readiness["auto_rename"] = False if auto_name else readiness["auto_rename"]
+    for required in ("visual", "agent", "text_embedding"):
+        stage = stages.get(required)
+        if stage is None or not (
+            stage.get("status") == "succeeded"
+            or (stage.get("status") == "skipped" and stage.get("skip_reason") == "already_ready")
+        ):
+            readiness[required] = False
+
+    auto_rename_stage = stages.get("auto_rename")
+    if auto_name:
+        warning_code = None
+        if isinstance(auto_rename_stage, Mapping) and auto_rename_stage.get("status") == "warning":
+            error = auto_rename_stage.get("error")
+            warning_code = error.get("error") if isinstance(error, Mapping) else None
+        readiness["auto_rename"] = bool(
+            isinstance(auto_rename_stage, Mapping)
+            and (
+                auto_rename_stage.get("status") == "succeeded"
+                or (
+                    auto_rename_stage.get("status") == "skipped"
+                    and auto_rename_stage.get("skip_reason") == "already_ready"
+                )
+            )
+            and warning_code is None
+        )
+    else:
+        readiness["auto_rename"] = True
+    return readiness
+
+
+def _core_image_ready(request: Request, record: Meme, image: Path, policy: str, *, auto_name: bool = False) -> bool:
+    """按当前图片、Agent 策略和文本模型判断所有必需产物是否有效。"""
+    readiness = _core_image_readiness(request, record, image, policy, auto_name=auto_name)
+    return all(readiness[stage] for stage in ("visual", "agent", "text_embedding")) and (
+        not auto_name or readiness["auto_rename"]
+    )
 
 
 async def process_unready_image_library(request: Request, payload: ProcessingBatchRequest) -> dict[str, object]:
@@ -1732,7 +1766,16 @@ async def process_unready_image_library(request: Request, payload: ProcessingBat
             last_id = meme.id
             try:
                 image = _service(request, "metadata").blob_store.resolve(meme.storage_key)
-                if _core_image_ready(request, meme, image, options.reverse_image_policy, auto_name=options.auto_name):
+                readiness = _core_image_readiness(
+                    request,
+                    meme,
+                    image,
+                    options.reverse_image_policy,
+                    auto_name=options.auto_name,
+                )
+                if all(readiness[stage] for stage in ("visual", "agent", "text_embedding")) and (
+                    not options.auto_name or readiness["auto_rename"]
+                ):
                     results.append(
                         {
                             "meme_id": str(meme.id),
@@ -1749,6 +1792,7 @@ async def process_unready_image_library(request: Request, payload: ProcessingBat
                     reverse_image_policy=options.reverse_image_policy,
                     auto_name=options.auto_name,
                     processing_mode="repair",
+                    readiness=readiness,
                     schedule=True,
                 )
                 results.append(

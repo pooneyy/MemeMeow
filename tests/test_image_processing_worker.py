@@ -9,9 +9,9 @@ from uuid import uuid4
 import pytest
 
 import backend.image_processing as image_processing
-from backend.image_processing import ImageProcessingError, ImageProcessingOptions, ImageProcessingWorker, normalize_auto_name, normalize_reverse_image_policy
+from backend.image_processing import ImageProcessingError, ImageProcessingOptions, ImageProcessingRepository, ImageProcessingWorker, normalize_auto_name, normalize_reverse_image_policy, processing_config_hash
 from backend.operation_policy import AllowAllOperationPolicy, GrantAssociationStore, OperationPolicyGateway, Operations, PolicyDecision
-from backend.persistence.models import ScopeContext
+from backend.persistence.models import ImageProcessingJob, ScopeContext
 from backend.services.tasks import PostgresTaskService
 
 
@@ -427,6 +427,59 @@ def test_worker_reuses_existing_planned_leaf_after_restart() -> None:
     assert prepared == []
     assert failures == []
     assert transitions[-1]["status"] == "running"
+
+
+def test_repair_readiness_does_not_trust_succeeded_stage_without_visual_artifact() -> None:
+    """修复计划不能把历史 succeeded 阶段的缺失视觉向量当成无需处理。"""
+    meme_id = uuid4()
+    config: dict[str, object] = {
+        "visual_model": "visual",
+        "preprocess_version": "v1",
+        "visual_dimensions": 2,
+    }
+    job = ImageProcessingJob(
+        id=uuid4(),
+        scope_id="local",
+        meme_id=meme_id,
+        image_sha256="a" * 64,
+        processing_config=config,
+        processing_config_hash=processing_config_hash(config),
+        reverse_image_policy="forbid",
+        metadata_hash=None,
+    )
+    stage_rows = [
+        SimpleNamespace(stage="visual", status="succeeded", skip_reason=None),
+        SimpleNamespace(stage="agent", status="succeeded", skip_reason=None),
+        SimpleNamespace(stage="auto_rename", status="skipped", skip_reason="disabled"),
+        SimpleNamespace(stage="text_embedding", status="succeeded", skip_reason=None),
+    ]
+    meme = SimpleNamespace(
+        id=meme_id,
+        scope_id="local",
+        sha256="a" * 64,
+        context_status="pending",
+        provenance={},
+        meme_context={},
+        search_metadata_hash=None,
+    )
+
+    class _Session:
+        """按 repository 查询顺序返回历史阶段、目标 Meme 和缺失向量。"""
+
+        def scalars(self, _statement):
+            """返回历史 Job 阶段。"""
+            return stage_rows
+
+        def scalar(self, _statement):
+            """第一次返回 Meme，后续视觉产物查询返回缺失。"""
+            if not hasattr(self, "meme_returned"):
+                self.meme_returned = True
+                return meme
+            return None
+
+    readiness = ImageProcessingRepository._readiness_from_job(_Session(), job, config=config, reverse_image_policy="forbid", metadata_hash=None)
+
+    assert readiness["visual"] is False
 
 
 def test_worker_rejects_changed_target_before_creating_leaf() -> None:

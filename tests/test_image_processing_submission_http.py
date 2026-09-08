@@ -223,7 +223,11 @@ def test_scope_repair_reports_images_that_are_already_ready(monkeypatch: pytest.
     monkeypatch.setattr(api, "_environment", lambda _request: _ScopeEnvironment())
     monkeypatch.setattr(api, "_request_scope", lambda _request: SimpleNamespace(scope_id="local"))
     monkeypatch.setattr(api, "_service", lambda _request, _name: metadata)
-    monkeypatch.setattr(api, "_core_image_ready", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        api,
+        "_core_image_readiness",
+        lambda *_args, **_kwargs: {"visual": True, "agent": True, "auto_rename": True, "text_embedding": True},
+    )
 
     payload = api.ProcessingBatchRequest(reverse_image_policy="forbid", auto_name=False)
     result = asyncio.run(api.process_unready_image_library(SimpleNamespace(query_params={}), payload))

@@ -313,6 +313,7 @@ class ImageProcessingRepository:
         auto_name: object = None,
         processing_mode: str = "normal",
         explicit_retry: bool = False,
+        readiness: Mapping[str, bool] | None = None,
     ) -> ImageProcessingJob:
         """按创建时固定的处理方式建立 Job；普通处理可幂等观察同选项活动 Job。"""
         policy = normalize_reverse_image_policy(reverse_image_policy)
@@ -369,6 +370,7 @@ class ImageProcessingRepository:
                 config=config,
                 reverse_image_policy=policy,
                 metadata_hash=metadata_hash,
+                readiness=readiness,
             )
             stage_plan = build_stage_plan(processing_mode, auto_name=auto_name_value, readiness=readiness)
             if processing_mode == "repair" and not any(planned for planned, _reason in stage_plan.values()):
@@ -458,6 +460,7 @@ class ImageProcessingRepository:
                 config=config,
                 reverse_image_policy=policy,
                 metadata_hash=metadata_hash,
+                readiness=readiness,
             )
             stage_plan = build_stage_plan(processing_mode, auto_name=auto_name_value, readiness=readiness)
             if processing_mode == "repair" and not any(planned for planned, _reason in stage_plan.values()):
@@ -510,6 +513,7 @@ class ImageProcessingRepository:
         auto_name: object = None,
         processing_mode: str = "normal",
         explicit_retry: bool = False,
+        readiness: Mapping[str, bool] | None = None,
     ) -> ImageProcessingJob:
         """在调用方持有的短事务中锁图、检查活动执行并创建固定 Job。
 
@@ -568,6 +572,7 @@ class ImageProcessingRepository:
             config=config,
             reverse_image_policy=policy,
             metadata_hash=metadata_hash,
+            readiness=readiness,
         )
         stage_plan = build_stage_plan(processing_mode, auto_name=auto_name_value, readiness=readiness)
         if processing_mode == "repair" and not any(planned for planned, _reason in stage_plan.values()):
@@ -719,13 +724,20 @@ class ImageProcessingRepository:
         config: Mapping[str, object] | None = None,
         reverse_image_policy: str | None = None,
         metadata_hash: str | None = None,
+        readiness: Mapping[str, bool] | None = None,
     ) -> dict[str, bool]:
-        """按当前提交选项和最近 Job 阶段事实构造创建时的就绪快照。
+        """按当前提交选项和真实产物事实构造创建时的就绪快照。
 
-        Job 阶段状态只能说明上一轮执行是否收束；当前配置、联网策略或语境指纹
-        变化时，旧状态不能继续作为修复计划的跳过依据。这里仅读取数据库事实，
-        文件和模型等耗时校验仍由事务外的调用方负责。
+        ``readiness`` 是调用方在事务外取得的权威快照，主要用于 scope 修复接口，
+        这样文件身份和数据库产物检查不会被旧 Job 阶段状态覆盖。没有快照时，
+        仍在当前短事务内复核数据库中的实际阶段产物；旧阶段显示 succeeded 但产物
+        已被删除时必须返回未就绪。文件和模型等耗时校验仍由事务外的调用方负责。
         """
+        if readiness is not None:
+            return {
+                stage: type(readiness.get(stage, False)) is bool and readiness.get(stage, False)
+                for stage in STAGES
+            }
         if job is None:
             return {stage: False for stage in STAGES}
         rows = session.scalars(
@@ -734,28 +746,99 @@ class ImageProcessingRepository:
                 ImageProcessingStage.job_id == job.id,
             )
         )
-        readiness = {stage: False for stage in STAGES}
+        stage_readiness = {stage: False for stage in STAGES}
         for row in rows:
-            # warning 明确表示自动命名仍未就绪；skipped 只表示本次未执行，不能
-            # 伪装成当前图片产物已经可用。
             stage = getattr(row, "stage", None)
-            if stage in readiness:
+            if stage in stage_readiness:
                 status = getattr(row, "status", None)
-                readiness[stage] = status == "succeeded" or (
+                stage_readiness[stage] = status == "succeeded" or (
                     status == "skipped" and getattr(row, "skip_reason", None) == "already_ready"
                 )
         if config is not None and processing_config_hash(config) != getattr(job, "processing_config_hash", None):
             # 配置哈希包含视觉、Agent 和文本向量的输入；无法证明其中哪一项仍然
             # 对应当前配置时，保守地让三个核心阶段重新建立结果。
             for stage in ("visual", "agent", "text_embedding"):
-                readiness[stage] = False
+                stage_readiness[stage] = False
         if reverse_image_policy is not None and getattr(job, "reverse_image_policy", None) != reverse_image_policy:
             # 联网策略只影响 Agent 语境及其派生文本索引，不影响视觉向量。
-            readiness["agent"] = False
-            readiness["text_embedding"] = False
+            stage_readiness["agent"] = False
+            stage_readiness["text_embedding"] = False
         if metadata_hash is None or getattr(job, "metadata_hash", None) != metadata_hash:
-            readiness["text_embedding"] = False
-        return readiness
+            stage_readiness["text_embedding"] = False
+
+        # 轻量测试替身和迁移前无法完整映射的旧对象只能沿用阶段状态；真实 ORM
+        # Job 则必须再次核对当前数据库产物，避免历史 succeeded 被误当成可复用。
+        if not isinstance(job, ImageProcessingJob):
+            return stage_readiness
+        meme = session.scalar(
+            select(Meme).where(
+                Meme.scope_id == getattr(job, "scope_id", None),
+                Meme.id == job.meme_id,
+            )
+        )
+        if meme is None or str(meme.sha256).lower() != str(job.image_sha256).lower():
+            return {stage: False for stage in STAGES}
+        current_config = dict(config or getattr(job, "processing_config", None) or {})
+        current_config_hash = processing_config_hash(current_config)
+        if current_config_hash != getattr(job, "processing_config_hash", None):
+            return {stage: False for stage in STAGES}
+
+        visual_model = current_config.get("visual_model")
+        visual_preprocess = current_config.get("preprocess_version")
+        try:
+            visual_dimensions = int(current_config.get("visual_dimensions", -1))
+        except (TypeError, ValueError):
+            visual_dimensions = -1
+        visual = session.scalar(
+            select(MemeVisualEmbedding).where(
+                MemeVisualEmbedding.scope_id == meme.scope_id,
+                MemeVisualEmbedding.meme_id == meme.id,
+                MemeVisualEmbedding.model == visual_model,
+                MemeVisualEmbedding.preprocess_version == visual_preprocess,
+                MemeVisualEmbedding.dimensions == visual_dimensions,
+                MemeVisualEmbedding.image_sha256 == meme.sha256,
+            )
+        )
+        stage_readiness["visual"] = stage_readiness["visual"] and visual is not None and visual.embedding is not None
+
+        summary = (meme.provenance or {}).get("agent_context")
+        agent_ready = (
+            meme.context_status == "ready"
+            and isinstance(summary, Mapping)
+            and summary.get("image_sha256") == meme.sha256
+            and summary.get("model") == current_config.get("agent_model")
+            and summary.get("reverse_image_policy") == normalize_reverse_image_policy(job.reverse_image_policy)
+            and summary.get("processing_config_hash") == getattr(job, "processing_config_hash", None)
+            and ("skill_hash" not in current_config or summary.get("skill_hash") == current_config.get("skill_hash"))
+            and bool(summary.get("task_id") and summary.get("completed_at"))
+        )
+        stage_readiness["agent"] = stage_readiness["agent"] and agent_ready
+
+        try:
+            current_metadata_hash = semantic_document_hash(MemeContext.model_validate(meme.meme_context or {}))
+        except Exception:  # noqa: BLE001 - 非法历史语境只能视为文本阶段未就绪
+            current_metadata_hash = None
+        stored_metadata_hash = getattr(meme, "search_metadata_hash", None)
+        if stored_metadata_hash is not None and stored_metadata_hash != current_metadata_hash:
+            current_metadata_hash = None
+        expected_metadata_hash = getattr(job, "metadata_hash", None) or current_metadata_hash
+        text_model = current_config.get("embedding_model")
+        text_row = None
+        if isinstance(expected_metadata_hash, str) and isinstance(text_model, str) and text_model:
+            text_row = session.scalar(
+                select(MemeTextEmbedding).where(
+                    MemeTextEmbedding.scope_id == meme.scope_id,
+                    MemeTextEmbedding.meme_id == meme.id,
+                    MemeTextEmbedding.image_sha256 == meme.sha256,
+                    MemeTextEmbedding.metadata_hash == expected_metadata_hash,
+                    MemeTextEmbedding.embedding_model_version == text_model,
+                    MemeTextEmbedding.dimensions == EMBEDDING_DIMENSIONS,
+                    MemeTextEmbedding.status == "ready",
+                    MemeTextEmbedding.embedding.is_not(None),
+                )
+            )
+        stage_readiness["text_embedding"] = stage_readiness["text_embedding"] and text_row is not None
+        return stage_readiness
 
     def _new_queued_job(
         self,
@@ -1319,8 +1402,13 @@ class ImageProcessingSubmissionCoordinator:
         auto_name: object = None,
         processing_mode: str = "normal",
         explicit_retry: bool = False,
+        readiness: Mapping[str, bool] | None = None,
     ) -> ImageProcessingJob:
-        """在提交事务内创建完整重试或修复 Job，并返回已持久化的 ORM 行。"""
+        """在提交事务内创建完整重试或修复 Job，并返回已持久化的 ORM 行。
+
+        ``readiness`` 是修复请求在事务外取得的阶段就绪快照；传入后会原样冻结到
+        本次 Job 计划，避免事务内的旧 Job 状态掩盖真实产物缺失。
+        """
         environment_factory = getattr(self.resources, "environment", None)
         if callable(environment_factory):
             with environment_factory(self.scope) as environment:
@@ -1334,6 +1422,7 @@ class ImageProcessingSubmissionCoordinator:
                     auto_name=auto_name,
                     processing_mode=processing_mode,
                     explicit_retry=explicit_retry,
+                    readiness=readiness,
                 )
         with self.resources.factory() as session:
             job = self.jobs.create_queued_in_session(
@@ -1346,6 +1435,7 @@ class ImageProcessingSubmissionCoordinator:
                 auto_name=auto_name,
                 processing_mode=processing_mode,
                 explicit_retry=explicit_retry,
+                readiness=readiness,
             )
             session.commit()
             return job
@@ -1418,6 +1508,7 @@ class ImageProcessingWorker:
         auto_name: object = None,
         processing_mode: str = "normal",
         explicit_retry: bool = False,
+        readiness: Mapping[str, bool] | None = None,
         schedule: bool = True,
     ) -> ImageProcessingSnapshot:
         """创建固定处理方式的 Job 并安排逐图处理，不等待任一叶子 Task。"""
@@ -1435,6 +1526,7 @@ class ImageProcessingWorker:
                 auto_name=auto_name,
                 processing_mode=processing_mode,
                 explicit_retry=False,
+                readiness=readiness,
             )
         else:
             job = self.jobs.create_or_reuse(
@@ -1446,6 +1538,7 @@ class ImageProcessingWorker:
                 auto_name=auto_name,
                 processing_mode=processing_mode,
                 explicit_retry=False,
+                readiness=readiness,
             )
         if schedule:
             self.schedule(job.id)
