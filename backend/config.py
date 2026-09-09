@@ -117,6 +117,8 @@ class Settings(BaseSettings):
     opencode_base_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_BASE_URL", "opencode_base_url"))
     opencode_api_key: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_API_KEY", "opencode_api_key"), repr=False)
     serpapi_api_key: str | None = Field(default=None, validation_alias=AliasChoices("SERPAPI_API_KEY", "serpapi_api_key"), repr=False)
+    reverse_image_provider: str = Field(default="serpapi", validation_alias=AliasChoices("MEMEMEOW_REVERSE_IMAGE_PROVIDER", "reverse_image_provider"))
+    google_cloud_project: str | None = Field(default=None, validation_alias=AliasChoices("GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT", "google_cloud_project"))
     reverse_image_cache_root: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_REVERSE_IMAGE_CACHE_ROOT", "reverse_image_cache_root"))
     reverse_image_internal_url: str = Field(default="http://127.0.0.1:8275/internal/reverse-image/search", validation_alias=AliasChoices("MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL", "reverse_image_internal_url"))
     opencode_runtime_root: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_RUNTIME_ROOT", "opencode_runtime_root"))
@@ -183,6 +185,8 @@ class Settings(BaseSettings):
         "opencode_base_url",
         "opencode_api_key",
         "serpapi_api_key",
+        "reverse_image_provider",
+        "google_cloud_project",
         "opencode_runtime_root",
         "reverse_image_cache_root",
         "opencode_node_modules",
@@ -222,6 +226,8 @@ class Settings(BaseSettings):
             raise ValueError("postgresql_required")
         if self.agent_runtime_mode not in {"auto", "executor", "host"}:
             raise ValueError("agent_runtime_mode_invalid")
+        if self.reverse_image_provider not in {"serpapi", "google_vision"}:
+            raise ValueError("reverse_image_provider_invalid")
         if self.public_release_profile.strip().casefold() not in {"local", "development", "dev", "test", "production", "public", "1", "true", "yes", "on"}:
             raise ValueError("public_release_profile_invalid")
         validate_agent_backpressure(self.agent_backpressure)
@@ -407,7 +413,7 @@ class Settings(BaseSettings):
             "agent_resume_timeout_seconds": self.agent_resume_timeout_seconds,
             "opencode_configured": bool(self.opencode_executable and self.opencode_model and self.opencode_base_url and self.opencode_api_key),
             "embedding_cache_ready": cache_ready,
-            "reverse_image_available": bool(self.serpapi_api_key),
+            "reverse_image_available": bool(self.serpapi_api_key) if self.reverse_image_provider == "serpapi" else bool(self.google_cloud_project or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT")),
             "runtime_ready": runtime_ready,
             "settings_admin_enabled": bool(self.settings_admin_token),
         }
