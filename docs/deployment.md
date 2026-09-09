@@ -29,7 +29,13 @@ Agent 的 HOME、workspace 和任务结果都在初始化过的 runtime volume �
 - 容器不会挂载项目根目录、数据库凭据、用户目录或 Docker socket。
 - 后端只向 `http://mememeow-agent-runtime:8277` 发送带 token 的结构化任务。
 - 每个任务使用独立 OpenCode session 和 `task-results/<task_id>/` 结果目录。
-- 反向图片能力由后端内部接口统一代理，Agent 不持有 `SERPAPI_API_KEY`。
+- 反向图片能力由后端内部接口统一代理，Agent 不持有 Google 凭证或 `SERPAPI_API_KEY`。
+
+联网以图搜图默认使用 Google Cloud Vision Web Detection。部署时设置
+`GOOGLE_CLOUD_PROJECT`，并通过服务账号 JSON 的 `GOOGLE_APPLICATION_CREDENTIALS`
+或 Google ADC 提供凭证；凭证只放在 API 进程可读的受控目录中。需要保留旧供应商时，
+显式设置 `MEMEMEOW_REVERSE_IMAGE_PROVIDER=serpapi` 并提供 `SERPAPI_API_KEY`。一次调用失败
+不会自动切换供应商。
 
 ### 运行模式
 Agent 运行模式仅支持 `auto`、`executor` 和 `host`。

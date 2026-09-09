@@ -9,8 +9,8 @@ operation grant；它只证明一次受控 Agent 执行可以调用指定的内�
 1. 为 API 配置 `MEMEMEOW_AGENT_CALLBACK_SECRET`。密钥必须是随机、非空且至少 16 字节；
    空值、控制字符、过短值或 verifier 初始化失败都会让 callback fail-closed。
 2. 确认 Agent executor 使用独立的 `MEMEMEOW_AGENT_EXECUTOR_TOKEN` 或 named volume
-   token。executor Bearer token、callback 根 secret、`SERPAPI_API_KEY`、数据库凭据和
-   operation grant 不得相互复用。
+   token。executor Bearer token、callback 根 secret、Google 凭证、`SERPAPI_API_KEY`、
+   数据库凭据和 operation grant 不得相互复用。
 3. 先运行数据库迁移和 callback 拒绝回归，再启动 Agent 调度。`0015_bind_agent_callback_request_ids`
    会先检测 `agent_callback_requests` 的历史重复逻辑键和不完整绑定；发现异常时停止迁移，
    不删除、合并或猜测覆盖既有事实。Runner 只能拿到当前
@@ -21,7 +21,7 @@ operation grant；它只证明一次受控 Agent 执行可以调用指定的内�
    返回唯一权威 ID。`input_digest` 如果由旧客户端提交只作为一致性声明，不能覆盖服务端重算值。
    `forbid` 不
    读取缓存、不 acquire、不联系 provider；`auto` 仍须经过当前 callback 校验和
-   `analysis.reverse_image_search` acquire。SerpApi 密钥只留在 API。
+   `analysis.reverse_image_search` acquire。Google 凭证和 SerpApi 密钥只留在 API。
 
 旧的在途任务不补发宽权限 token。没有当前完整 claim 的任务应以
 `agent_callback_invalid_execution` 或稳定任务失败收束，随后由显式重试创建新的 claim；

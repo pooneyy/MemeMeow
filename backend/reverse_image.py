@@ -1,12 +1,13 @@
 """后端反向图片检索服务。
 
-该模块位于 FastAPI 内部接口与供应商之间，负责任务策略校验、旧缓存兼容、同键互斥、
-SerpApi 适配、敏感字段脱敏以及 usage event 的事实记录。Agent 只接触这里返回的
-供应商无关 JSON，不会获得供应商密钥或临时上传标识。
+该模块位于 FastAPI 内部接口与供应商之间，负责任务策略校验、缓存互斥、Google Vision
+和 SerpApi 适配、敏感字段脱敏以及 usage event 的事实记录。Agent 只接触这里返回的
+供应商无关 JSON，不会获得供应商凭证或临时上传标识。
 """
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -45,6 +46,12 @@ MAX_UPLOAD_BYTES = 500 * 1024
 CACHE_SCHEMA_VERSION = 1
 EMPTY_TTL = timedelta(days=3)
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+GOOGLE_VISION_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+GOOGLE_VISION_ANNOTATE_URL = "https://vision.googleapis.com/v1/images:annotate"
+GOOGLE_VISION_PROVIDER = "google_vision"
+GOOGLE_VISION_ENGINE = "web_detection"
+SERPAPI_PROVIDER = "serpapi"
+SERPAPI_ENGINE = "google_lens"
 REMOVED_RESPONSE_KEYS = {
     "api_key",
     "image_id",
@@ -58,6 +65,14 @@ REMOVED_RESPONSE_KEYS = {
     "about_page_serpapi_link",
 }
 PROVIDER_RESULT_LIST_FIELDS = ("visual_matches", "exact_matches", "related_content", "products", "text_results")
+GOOGLE_RESULT_LIST_FIELDS = (
+    "pages_with_matching_images",
+    "full_matching_images",
+    "partial_matching_images",
+    "visually_similar_images",
+    "web_entities",
+    "best_guess_labels",
+)
 PROVIDER_RESULT_OBJECT_FIELDS = ("knowledge_graph", "about_this_image")
 
 
@@ -145,11 +160,11 @@ class ReverseImageRequest:
             input_digest=input_digest,
         )
 
-    def identity(self, image_sha256: str) -> dict[str, object]:
+    def identity(self, image_sha256: str, *, provider: str = GOOGLE_VISION_PROVIDER, engine: str = GOOGLE_VISION_ENGINE) -> dict[str, object]:
         """构造不包含路径、策略或密钥的稳定缓存身份。"""
         return {
-            "provider": "serpapi",
-            "engine": "google_lens",
+            "provider": provider,
+            "engine": engine,
             "image_sha256": image_sha256,
             "search_type": self.search_type,
             "language": self.language,
@@ -294,7 +309,7 @@ def _is_empty(response: Mapping[str, object]) -> bool:
     """区分合法空结果和缺少结果结构的非法供应商响应。"""
     if not isinstance(response, Mapping):
         raise ReverseImageError("reverse_image_provider_invalid", "反向图片服务返回了无效结果", retryable=True, status_code=503)
-    present_lists = [field for field in PROVIDER_RESULT_LIST_FIELDS if field in response]
+    present_lists = [field for field in (*PROVIDER_RESULT_LIST_FIELDS, *GOOGLE_RESULT_LIST_FIELDS) if field in response]
     present_objects = [field for field in PROVIDER_RESULT_OBJECT_FIELDS if field in response]
     if not present_lists and not present_objects:
         raise ReverseImageError("reverse_image_provider_invalid", "反向图片服务返回了无效结果", retryable=True, status_code=503)
@@ -303,6 +318,203 @@ def _is_empty(response: Mapping[str, object]) -> bool:
     if any(not isinstance(response[field], Mapping) for field in present_objects):
         raise ReverseImageError("reverse_image_provider_invalid", "反向图片服务返回了无效结果", retryable=True, status_code=503)
     return not any(response[field] for field in (*present_lists, *present_objects))
+
+
+def _mapping_list(value: object) -> list[dict[str, object]]:
+    """校验 Google 返回的对象列表，只保留可序列化的映射项。"""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ReverseImageError("reverse_image_provider_invalid", "反向图片服务返回了无效结果", retryable=True, status_code=503)
+    return [dict(item) for item in value if isinstance(item, Mapping)]
+
+
+def google_vision_credentials_configured(settings: Settings) -> bool:
+    """判断服务端是否存在可供 Google ADC 使用的凭证来源，不读取或返回凭证内容。"""
+    configured_path = settings.google_application_credentials or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if configured_path:
+        return Path(configured_path).is_file()
+    cloud_sdk_config = Path(os.getenv("CLOUDSDK_CONFIG", Path.home() / ".config" / "gcloud"))
+    if (cloud_sdk_config / "application_default_credentials.json").is_file():
+        return True
+    # 云主机元数据凭证没有本地文件；项目标识是此类部署的唯一可见配置。
+    return bool(settings.google_cloud_project or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT"))
+
+
+def _google_project_id(configured: str | None, detected: str | None) -> str:
+    """按显式配置、环境变量和 ADC 探测结果确定计费项目。"""
+    project_id = configured or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT") or detected
+    if not project_id:
+        raise ReverseImageError("reverse_image_provider_unavailable", "Google Cloud 项目未配置", retryable=True, status_code=503)
+    return project_id
+
+
+def _google_image_item(item: Mapping[str, object]) -> dict[str, object]:
+    """把 Google 图片候选转换为 Agent 常用的链接字段。"""
+    url = item.get("url")
+    if not isinstance(url, str) or not url:
+        return {}
+    return {"link": url, "source": url}
+
+
+def _google_page_item(item: Mapping[str, object]) -> dict[str, object]:
+    """把 Google 匹配网页转换为 Agent 常用的标题、链接和来源字段。"""
+    result: dict[str, object] = {}
+    title = item.get("pageTitle")
+    url = item.get("url")
+    if isinstance(title, str) and title:
+        result["title"] = title
+        result["source"] = title
+    if isinstance(url, str) and url:
+        result["link"] = url
+        result.setdefault("source", url)
+    return result
+
+
+def _deduplicate_links(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    """按链接去重，保留 Google 返回顺序。"""
+    seen: set[str] = set()
+    result: list[dict[str, object]] = []
+    for item in items:
+        link = item.get("link")
+        marker = str(link) if isinstance(link, str) and link else json.dumps(item, ensure_ascii=False, sort_keys=True)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(item)
+    return result
+
+
+def _normalize_google_web_detection(web_detection: Mapping[str, object]) -> dict[str, object]:
+    """将 Google Web Detection 分组整理为通用候选和 Google 专属字段。"""
+    pages = _mapping_list(web_detection.get("pagesWithMatchingImages"))
+    full = _mapping_list(web_detection.get("fullMatchingImages"))
+    partial = _mapping_list(web_detection.get("partialMatchingImages"))
+    similar = _mapping_list(web_detection.get("visuallySimilarImages"))
+    entities = _mapping_list(web_detection.get("webEntities"))
+    labels = _mapping_list(web_detection.get("bestGuessLabels"))
+
+    page_matches = [_google_page_item(item) for item in pages]
+    exact_matches = [_google_image_item(item) for item in full]
+    partial_matches = [_google_image_item(item) for item in partial]
+    similar_matches = [_google_image_item(item) for item in similar]
+    visual_matches = _deduplicate_links([*page_matches, *exact_matches, *partial_matches, *similar_matches])
+    normalized_entities = [
+        {
+            key: value
+            for key, value in {
+                "description": item.get("description"),
+                "entity_id": item.get("entityId"),
+                "score": item.get("score"),
+            }.items()
+            if value is not None
+        }
+        or dict(item)
+        for item in entities
+    ]
+    normalized_labels = [
+        {
+            key: value
+            for key, value in {
+                "label": item.get("label"),
+                "language": item.get("languageCode"),
+            }.items()
+            if value is not None
+        }
+        or dict(item)
+        for item in labels
+    ]
+    groups = {
+        "pages_with_matching_images": pages,
+        "full_matching_images": full,
+        "partial_matching_images": partial,
+        "visually_similar_images": similar,
+        "web_entities": entities,
+        "best_guess_labels": labels,
+    }
+    return {
+        "visual_matches": visual_matches,
+        "exact_matches": exact_matches,
+        "related_content": _deduplicate_links([*partial_matches, *similar_matches]),
+        "pages_with_matching_images": page_matches,
+        "full_matching_images": exact_matches,
+        "partial_matching_images": partial_matches,
+        "visually_similar_images": similar_matches,
+        "web_entities": normalized_entities,
+        "best_guess_labels": normalized_labels,
+        "google_vision_web_detection": groups,
+    }
+
+
+class GoogleVisionWebDetectionProvider:
+    """调用 Google Cloud Vision Web Detection 的服务端 provider。"""
+
+    def __init__(self, *, project_id: str | None = None, credentials_path: Path | None = None, timeout: float = 60.0, max_results: int = 20):
+        self.project_id = project_id
+        self.credentials_path = credentials_path
+        self.timeout = timeout
+        self.max_results = max(1, min(max_results, 50))
+
+    def _credentials(self) -> tuple[object, str]:
+        """从服务端 JSON 或 ADC 读取凭证，并确定请求的计费项目。"""
+        try:
+            import google.auth
+            from google.auth.exceptions import DefaultCredentialsError
+
+            if self.credentials_path:
+                credentials, detected_project = google.auth.load_credentials_from_file(str(self.credentials_path), scopes=[GOOGLE_VISION_SCOPE])
+            else:
+                credentials, detected_project = google.auth.default(scopes=[GOOGLE_VISION_SCOPE])
+        except DefaultCredentialsError as exc:
+            raise ReverseImageError("reverse_image_provider_unavailable", "Google Vision 凭证不可用", retryable=True, status_code=503) from exc
+        except (OSError, ValueError) as exc:
+            raise ReverseImageError("reverse_image_provider_unavailable", "Google Vision 凭证不可用", retryable=True, status_code=503) from exc
+        return credentials, _google_project_id(self.project_id, detected_project)
+
+    def search(self, request: ReverseImageRequest) -> dict[str, object]:
+        """提交一次 Web Detection 请求并返回已整理、可缓存的结果。"""
+        credentials, project_id = self._credentials()
+        request_body = {
+            "requests": [
+                {
+                    "image": {"content": base64.b64encode(request.image).decode("ascii")},
+                    "features": [{"type": "WEB_DETECTION", "maxResults": self.max_results}],
+                }
+            ]
+        }
+        try:
+            from google.auth.transport.requests import AuthorizedSession
+
+            session = AuthorizedSession(credentials)
+            try:
+                response = session.post(
+                    GOOGLE_VISION_ANNOTATE_URL,
+                    headers={"x-goog-user-project": project_id},
+                    json=request_body,
+                    timeout=self.timeout,
+                )
+            finally:
+                session.close()
+        except Exception as exc:  # noqa: BLE001 - 不把认证或响应细节交给 Agent
+            raise ReverseImageError("reverse_image_provider_unavailable", "Google Vision 请求失败", retryable=True, status_code=503) from exc
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise ReverseImageError("reverse_image_provider_invalid", "Google Vision 返回了无法解析的结果", retryable=True, status_code=503) from exc
+        if not getattr(response, "ok", False):
+            raise ReverseImageError("reverse_image_provider_unavailable", "Google Vision 请求失败", retryable=True, status_code=503)
+        if not isinstance(payload, Mapping):
+            raise ReverseImageError("reverse_image_provider_invalid", "Google Vision 返回了无效结果", retryable=True, status_code=503)
+        responses = payload.get("responses")
+        if not isinstance(responses, list) or len(responses) != 1 or not isinstance(responses[0], Mapping):
+            raise ReverseImageError("reverse_image_provider_invalid", "Google Vision 返回了无效结果", retryable=True, status_code=503)
+        response_body = responses[0]
+        if response_body.get("error") is not None:
+            raise ReverseImageError("reverse_image_provider_invalid", "Google Vision 返回了错误结果", retryable=True, status_code=503)
+        web_detection = response_body.get("webDetection")
+        if not isinstance(web_detection, Mapping):
+            raise ReverseImageError("reverse_image_provider_invalid", "Google Vision 缺少 Web Detection 结果", retryable=True, status_code=503)
+        return _normalize_google_web_detection(web_detection)
 
 
 class SerpApiGoogleLensProvider:
@@ -381,7 +593,7 @@ class ReverseImageService:
         self.settings = settings
         self.resources = resources
         self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
-        cache_root = settings.reverse_image_cache_root or settings.data_root / "reverse_image_cache" / "serpapi_google_lens"
+        cache_root = settings.reverse_image_cache_root or settings.data_root / "reverse_image_cache" / "web_detection"
         if self.scope.scope_id != "local":
             # 非 local scope 使用数据库分配的物理 namespace，客户端不能决定缓存目录。
             blob_root = resources.blob_store_for_scope(self.scope.scope_id).root
@@ -399,7 +611,34 @@ class ReverseImageService:
     @property
     def available(self) -> bool:
         """返回不含密钥的供应商可用状态。"""
-        return bool(self.settings.serpapi_api_key or self._provider_factory)
+        if self._provider_factory:
+            return True
+        if self.settings.reverse_image_provider == SERPAPI_PROVIDER:
+            return bool(self.settings.serpapi_api_key)
+        return google_vision_credentials_configured(self.settings)
+
+    @property
+    def provider_name(self) -> str:
+        """返回当前服务固定使用的 provider 名称。"""
+        return self.settings.reverse_image_provider
+
+    @property
+    def provider_engine(self) -> str:
+        """返回当前 provider 的缓存引擎标识。"""
+        return SERPAPI_ENGINE if self.provider_name == SERPAPI_PROVIDER else GOOGLE_VISION_ENGINE
+
+    def _provider(self) -> object:
+        """根据服务端配置创建唯一 provider；失败不会自动切换供应商。"""
+        if self._provider_factory is not None:
+            return self._provider_factory
+        if self.provider_name == SERPAPI_PROVIDER:
+            return SerpApiGoogleLensProvider(str(self.settings.serpapi_api_key))
+        if self.provider_name == GOOGLE_VISION_PROVIDER:
+            return GoogleVisionWebDetectionProvider(
+                project_id=self.settings.google_cloud_project,
+                credentials_path=self.settings.google_application_credentials,
+            )
+        raise ReverseImageError("reverse_image_provider_invalid", "反向图片 provider 配置无效", status_code=503)
 
     @staticmethod
     def _locked_auto_task(task: Task | None, request: ReverseImageRequest | None = None, *, scope_id: str | None = None) -> Task:
@@ -481,7 +720,7 @@ class ReverseImageService:
         """按 task_id 校验运行任务并执行一次供应商无关逻辑检索。"""
         request = request.normalized()
         image_sha = hashlib.sha256(request.image).hexdigest()
-        key = _fingerprint(request.identity(image_sha))
+        key = _fingerprint(request.identity(image_sha, provider=self.provider_name, engine=self.provider_engine))
         binding = request.callback_binding
         request_id = request.request_id
         callback_row = None
@@ -632,7 +871,7 @@ class ReverseImageService:
                     return self._event_output(event)
             with self.resources.environment(self.scope.scope_id) as environment:
                 task = self._locked_auto_task(environment.tasks.get(request.task_id), request, scope_id=self.scope.scope_id)
-                event = environment.reverse_image_usage.create(request_id=request_id, task_id=request.task_id, meme_id=(task.payload or {}).get("meme_id"), cache_key=key, cache_status="refresh" if record else "miss", provider="serpapi", **self._usage_binding(request))
+                event = environment.reverse_image_usage.create(request_id=request_id, task_id=request.task_id, meme_id=(task.payload or {}).get("meme_id"), cache_key=key, cache_status="refresh" if record else "miss", provider=self.provider_name, **self._usage_binding(request))
                 if event.task_id != request.task_id or event.cache_key != key:
                     raise ReverseImageError("usage_request_conflict", "请求标识已用于另一项检索", status_code=409)
                 if event.completed_at is not None:
@@ -674,7 +913,7 @@ class ReverseImageService:
                         meme_id=(task.payload or {}).get("meme_id"),
                         cache_key=key,
                         cache_status="refresh" if record else "miss",
-                        provider="serpapi",
+                        provider=self.provider_name,
                         **self._usage_binding(request),
                     )
                     event = environment.reverse_image_usage.finish(
@@ -723,11 +962,11 @@ class ReverseImageService:
                 if binding is not None:
                     environment.callback_requests.finish(request_id, state="unknown_execution", error={"error": "reverse_image_unknown_execution"})
             try:
-                provider = self._provider_factory or SerpApiGoogleLensProvider(str(self.settings.serpapi_api_key))
+                provider = self._provider()
                 response = provider(request) if callable(provider) else provider.search(request)
                 outcome = "empty" if _is_empty(response) else "success"
                 snapshot = {"fetched_at": timestamp.isoformat(), "outcome": outcome, "expires_at": (timestamp + EMPTY_TTL).isoformat() if outcome == "empty" else None, "response": sanitize_value(response)}
-                next_record = {"schema_version": CACHE_SCHEMA_VERSION, "provider": "serpapi", "engine": "google_lens", "request": request.identity(image_sha), "snapshots": [*(record or {}).get("snapshots", []), snapshot]}
+                next_record = {"schema_version": CACHE_SCHEMA_VERSION, "provider": self.provider_name, "engine": self.provider_engine, "request": request.identity(image_sha, provider=self.provider_name, engine=self.provider_engine), "snapshots": [*(record or {}).get("snapshots", []), snapshot]}
                 self.cache.write(key, next_record)
             except ReverseImageError as exc:
                 with self.resources.environment(self.scope.scope_id) as environment:

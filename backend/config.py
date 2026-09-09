@@ -117,8 +117,9 @@ class Settings(BaseSettings):
     opencode_base_url: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_BASE_URL", "opencode_base_url"))
     opencode_api_key: str | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_API_KEY", "opencode_api_key"), repr=False)
     serpapi_api_key: str | None = Field(default=None, validation_alias=AliasChoices("SERPAPI_API_KEY", "serpapi_api_key"), repr=False)
-    reverse_image_provider: str = Field(default="serpapi", validation_alias=AliasChoices("MEMEMEOW_REVERSE_IMAGE_PROVIDER", "reverse_image_provider"))
+    reverse_image_provider: str = Field(default="google_vision", validation_alias=AliasChoices("MEMEMEOW_REVERSE_IMAGE_PROVIDER", "reverse_image_provider"))
     google_cloud_project: str | None = Field(default=None, validation_alias=AliasChoices("GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT", "google_cloud_project"))
+    google_application_credentials: Path | None = Field(default=None, validation_alias=AliasChoices("GOOGLE_APPLICATION_CREDENTIALS", "google_application_credentials"), repr=False)
     reverse_image_cache_root: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_REVERSE_IMAGE_CACHE_ROOT", "reverse_image_cache_root"))
     reverse_image_internal_url: str = Field(default="http://127.0.0.1:8275/internal/reverse-image/search", validation_alias=AliasChoices("MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL", "reverse_image_internal_url"))
     opencode_runtime_root: Path | None = Field(default=None, validation_alias=AliasChoices("MEMEMEOW_OPENCODE_RUNTIME_ROOT", "opencode_runtime_root"))
@@ -187,6 +188,7 @@ class Settings(BaseSettings):
         "serpapi_api_key",
         "reverse_image_provider",
         "google_cloud_project",
+        "google_application_credentials",
         "opencode_runtime_root",
         "reverse_image_cache_root",
         "opencode_node_modules",
@@ -209,7 +211,7 @@ class Settings(BaseSettings):
         if self.opencode_runtime_root is None:
             self.opencode_runtime_root = self.data_root / "opencode"
         if self.reverse_image_cache_root is None:
-            self.reverse_image_cache_root = self.data_root / "reverse_image_cache" / "serpapi_google_lens"
+            self.reverse_image_cache_root = self.data_root / "reverse_image_cache" / "web_detection"
         if self.embedding_dimensions != 1024:
             raise ValueError("embedding_dimensions_must_be_1024")
         spec = visual_model_spec(self.visual_model)
@@ -379,6 +381,8 @@ class Settings(BaseSettings):
             "visual_model_dimensions": self.visual_model_dimensions,
             "visual_preprocess_version": self.visual_preprocess_version,
             "visual_available": self.visual_available,
+            "reverse_image_provider": self.reverse_image_provider,
+            "google_cloud_project_configured": self._configured(self.google_cloud_project or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT")),
             "database_configured": bool(self.database_url),
             "worker_lease_seconds": self.worker_lease_seconds,
             "worker_heartbeat_seconds": self.worker_heartbeat_seconds,
@@ -413,6 +417,7 @@ class Settings(BaseSettings):
             "agent_resume_timeout_seconds": self.agent_resume_timeout_seconds,
             "opencode_configured": bool(self.opencode_executable and self.opencode_model and self.opencode_base_url and self.opencode_api_key),
             "embedding_cache_ready": cache_ready,
+            "reverse_image_provider": self.reverse_image_provider,
             "reverse_image_available": bool(self.serpapi_api_key) if self.reverse_image_provider == "serpapi" else bool(self.google_cloud_project or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT")),
             "runtime_ready": runtime_ready,
             "settings_admin_enabled": bool(self.settings_admin_token),

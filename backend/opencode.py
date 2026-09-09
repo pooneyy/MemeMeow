@@ -824,7 +824,7 @@ class OpenCodeRunner:
             # 禁止向上合并项目根配置，避免任务意外使用其他 provider 或本地凭据。
             "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
             "MEMEMEOW_DATA_ROOT": str(runtime_root),
-            "MEMEMEOW_REVERSE_IMAGE_CACHE_ROOT": str(runtime_root / "reverse_image_cache" / "serpapi_google_lens"),
+            "MEMEMEOW_REVERSE_IMAGE_CACHE_ROOT": str(runtime_root / "reverse_image_cache" / "web_detection"),
             "MEMEMEOW_REVERSE_IMAGE_INTERNAL_URL": self._agent_reverse_image_url(),
             # 视觉 Skill 只接收 provider 物化的 task-scoped manifest，不获得
             # 数据库、模型运行时或视觉 callback 权限。

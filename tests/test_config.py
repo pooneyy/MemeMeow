@@ -22,6 +22,15 @@ def test_visual_defaults_pin_dinov2_vitb14_identity() -> None:
     assert settings.visual_preprocess_version == VISUAL_PREPROCESS_VERSION
 
 
+def test_reverse_image_defaults_to_google_vision_and_keeps_status_redacted() -> None:
+    """默认反向图片 provider 是 Google Vision，公开状态不包含凭证路径。"""
+    settings = Settings(_env_file=None)
+    assert settings.reverse_image_provider == "google_vision"
+    status = settings.status()
+    assert status["reverse_image_provider"] == "google_vision"
+    assert "google_application_credentials" not in status
+
+
 def test_upload_limits_default_to_public_two_lane_contract() -> None:
     """上传边界默认公开 20 文件、客户端 2 并发提示，并关闭可选总字节预算。"""
     settings = Settings(_env_file=None)
