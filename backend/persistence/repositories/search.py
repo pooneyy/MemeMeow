@@ -343,8 +343,6 @@ class SearchRepository:
         if not isinstance(model, str) or not model.strip():
             return set()
         model = model.strip()
-        if self.source_mode(model) != "incremental":
-            return set()
         meme_ids = {meme.id for meme in memes if isinstance(getattr(meme, "id", None), UUID)}
         if not meme_ids:
             return set()

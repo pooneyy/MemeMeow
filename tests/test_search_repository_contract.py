@@ -51,9 +51,23 @@ def test_valid_text_embedding_ids_does_not_fallback_to_in_memory_vectors() -> No
     pending_id = UUID("00000000-0000-0000-0000-000000000002")
     ready_meme = SimpleNamespace(id=ready_id)
     pending_meme = SimpleNamespace(id=pending_id)
-    repository.source_mode = lambda _model: "incremental"
-
     assert repository.valid_text_embedding_ids("model", [ready_meme, pending_meme]) == set()
+
+
+def test_valid_text_embedding_ids_uses_row_facts_when_search_source_is_not_ready(monkeypatch) -> None:
+    """列表状态按单张图片的有效向量判断，不受搜索来源发布状态影响。"""
+    repository = object.__new__(SearchRepository)
+    ready_id = UUID("00000000-0000-0000-0000-000000000001")
+    repository.scope = SimpleNamespace(scope_id="test-scope")
+    repository.session = SimpleNamespace(execute=lambda _statement: [(ready_id,)])
+
+    def unexpected_source_mode(_model: str) -> str:
+        """确保状态查询不会复用搜索来源门禁。"""
+        raise AssertionError("列表状态不应读取搜索来源状态")
+
+    monkeypatch.setattr(repository, "source_mode", unexpected_source_mode)
+
+    assert repository.valid_text_embedding_ids("model", [SimpleNamespace(id=ready_id)]) == {ready_id}
 
 
 def test_query_rejects_invalid_dimensions_and_zero_norm() -> None:
