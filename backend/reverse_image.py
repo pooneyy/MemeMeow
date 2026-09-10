@@ -52,6 +52,7 @@ GOOGLE_VISION_PROVIDER = "google_vision"
 GOOGLE_VISION_ENGINE = "web_detection"
 SERPAPI_PROVIDER = "serpapi"
 SERPAPI_ENGINE = "google_lens"
+DEFAULT_PROVIDER_CACHE_VARIANT = "default"
 REMOVED_RESPONSE_KEYS = {
     "api_key",
     "image_id",
@@ -160,11 +161,19 @@ class ReverseImageRequest:
             input_digest=input_digest,
         )
 
-    def identity(self, image_sha256: str, *, provider: str = GOOGLE_VISION_PROVIDER, engine: str = GOOGLE_VISION_ENGINE) -> dict[str, object]:
+    def identity(
+        self,
+        image_sha256: str,
+        *,
+        provider: str = GOOGLE_VISION_PROVIDER,
+        engine: str = GOOGLE_VISION_ENGINE,
+        cache_variant: str = DEFAULT_PROVIDER_CACHE_VARIANT,
+    ) -> dict[str, object]:
         """构造不包含路径、策略或密钥的稳定缓存身份。"""
         return {
             "provider": provider,
             "engine": engine,
+            "cache_variant": cache_variant,
             "image_sha256": image_sha256,
             "search_type": self.search_type,
             "language": self.language,
@@ -172,6 +181,28 @@ class ReverseImageRequest:
             "query": self.query,
             "auto_crop": self.auto_crop,
         }
+
+
+@dataclass(frozen=True)
+class ReverseImageProviderBinding:
+    """绑定宿主注入的反向图片实现及其非秘密缓存身份。
+
+    ``name``、``engine`` 和 ``cache_variant`` 共同区分缓存与执行事实；
+    ``search`` 是一次逻辑检索使用的 callable 或提供 ``search`` 方法的对象。
+    适配宿主在创建应用时构造该对象，公共服务只负责透传和调用。
+    """
+
+    name: str
+    engine: str
+    cache_variant: str
+    search: Callable[[ReverseImageRequest], dict[str, Any]] | object
+
+    def __post_init__(self) -> None:
+        """拒绝空身份或不可调用实现，避免运行后才产生错误缓存身份。"""
+        if any(not isinstance(value, str) or not value.strip() for value in (self.name, self.engine, self.cache_variant)):
+            raise ValueError("reverse_image_provider_binding_invalid")
+        if not callable(self.search) and not callable(getattr(self.search, "search", None)):
+            raise TypeError("reverse_image_provider_binding_invalid")
 
 
 def derive_controlled_crop(content: bytes, *, filename: str = "image.png") -> tuple[bytes, str]:
@@ -589,7 +620,20 @@ class ReverseImageService:
     local 默认值只服务于开源兼容夹具；应用请求使用 scope-bound facade。
     """
 
-    def __init__(self, settings: Settings, resources: DatabaseResources, *, scope_id: str | ScopeContext = "local", provider: Callable[[ReverseImageRequest], dict[str, Any]] | None = None, operation_policy: OperationPolicyGateway | object | None = None, grant_store: GrantAssociationStore | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        resources: DatabaseResources,
+        *,
+        scope_id: str | ScopeContext = "local",
+        provider: Callable[[ReverseImageRequest], dict[str, Any]] | None = None,
+        provider_binding: ReverseImageProviderBinding | None = None,
+        operation_policy: OperationPolicyGateway | object | None = None,
+        grant_store: GrantAssociationStore | None = None,
+    ):
+        """创建绑定单一 scope 和单一 provider 身份的反向图片服务。"""
+        if provider is not None and provider_binding is not None:
+            raise ValueError("reverse_image_provider_binding_conflict")
         self.settings = settings
         self.resources = resources
         self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
@@ -600,6 +644,7 @@ class ReverseImageService:
             cache_root = Path(cache_root) / "scopes" / blob_root.parent.name
         self.cache = ReverseImageCache(cache_root)
         self._provider_factory = provider
+        self._provider_binding = provider_binding
         if isinstance(operation_policy, OperationPolicyGateway):
             self.operation_policy = operation_policy
         elif operation_policy is None:
@@ -611,7 +656,7 @@ class ReverseImageService:
     @property
     def available(self) -> bool:
         """返回不含密钥的供应商可用状态。"""
-        if self._provider_factory:
+        if self._provider_binding is not None or self._provider_factory:
             return True
         if self.settings.reverse_image_provider == SERPAPI_PROVIDER:
             return bool(self.settings.serpapi_api_key)
@@ -620,15 +665,28 @@ class ReverseImageService:
     @property
     def provider_name(self) -> str:
         """返回当前服务固定使用的 provider 名称。"""
+        if self._provider_binding is not None:
+            return self._provider_binding.name
         return self.settings.reverse_image_provider
 
     @property
     def provider_engine(self) -> str:
         """返回当前 provider 的缓存引擎标识。"""
+        if self._provider_binding is not None:
+            return self._provider_binding.engine
         return SERPAPI_ENGINE if self.provider_name == SERPAPI_PROVIDER else GOOGLE_VISION_ENGINE
+
+    @property
+    def provider_cache_variant(self) -> str:
+        """返回当前 provider 的非秘密缓存变体。"""
+        if self._provider_binding is not None:
+            return self._provider_binding.cache_variant
+        return DEFAULT_PROVIDER_CACHE_VARIANT
 
     def _provider(self) -> object:
         """根据服务端配置创建唯一 provider；失败不会自动切换供应商。"""
+        if self._provider_binding is not None:
+            return self._provider_binding.search
         if self._provider_factory is not None:
             return self._provider_factory
         if self.provider_name == SERPAPI_PROVIDER:
@@ -720,7 +778,12 @@ class ReverseImageService:
         """按 task_id 校验运行任务并执行一次供应商无关逻辑检索。"""
         request = request.normalized()
         image_sha = hashlib.sha256(request.image).hexdigest()
-        key = _fingerprint(request.identity(image_sha, provider=self.provider_name, engine=self.provider_engine))
+        provider_identity = {
+            "provider": self.provider_name,
+            "engine": self.provider_engine,
+            "cache_variant": self.provider_cache_variant,
+        }
+        key = _fingerprint(request.identity(image_sha, **provider_identity))
         binding = request.callback_binding
         request_id = request.request_id
         callback_row = None
@@ -966,7 +1029,12 @@ class ReverseImageService:
                 response = provider(request) if callable(provider) else provider.search(request)
                 outcome = "empty" if _is_empty(response) else "success"
                 snapshot = {"fetched_at": timestamp.isoformat(), "outcome": outcome, "expires_at": (timestamp + EMPTY_TTL).isoformat() if outcome == "empty" else None, "response": sanitize_value(response)}
-                next_record = {"schema_version": CACHE_SCHEMA_VERSION, "provider": self.provider_name, "engine": self.provider_engine, "request": request.identity(image_sha, provider=self.provider_name, engine=self.provider_engine), "snapshots": [*(record or {}).get("snapshots", []), snapshot]}
+                next_record = {
+                    "schema_version": CACHE_SCHEMA_VERSION,
+                    **provider_identity,
+                    "request": request.identity(image_sha, **provider_identity),
+                    "snapshots": [*(record or {}).get("snapshots", []), snapshot],
+                }
                 self.cache.write(key, next_record)
             except ReverseImageError as exc:
                 with self.resources.environment(self.scope.scope_id) as environment:

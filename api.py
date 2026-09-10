@@ -51,7 +51,7 @@ from backend.paths import PathResolver, SUPPORTED_EXTENSIONS, validate_business_
 from backend.opencode import OpenCodeError, OpenCodeRunner
 from backend.opencode_workspace import LocalWorkspaceProvider, MissingWorkspaceProvider, TrustedWorkspaceContext, WorkspaceResolutionError
 from backend.opencode_activity import OpenCodeActivityReader
-from backend.reverse_image import ReverseImageService
+from backend.reverse_image import ReverseImageProviderBinding, ReverseImageService
 from backend.tasks import TaskRecord
 from backend.visual import VisualEmbeddingError, VisualInferenceClient, VisualSearchService, identity_from_settings
 from backend.visual_snapshot import visual_match_snapshot_summary
@@ -2177,7 +2177,7 @@ async def repair_metadata(request: Request) -> dict[str, object]:
     return await _repair_metadata_http(request, task_service=lambda received: _service(received, "tasks"))
 
 
-def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = None, operation_policy=None, callback_issuer=None, callback_verifier=None, agent_input_provider: Callable[[ScopeContext, Path], str | Path] | None = None, workspace_provider=None, extensions: Sequence[ApplicationExtension] | None = None) -> FastAPI:
+def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = None, operation_policy=None, callback_issuer=None, callback_verifier=None, agent_input_provider: Callable[[ScopeContext, Path], str | Path] | None = None, workspace_provider=None, reverse_image_provider_binding: ReverseImageProviderBinding | None = None, extensions: Sequence[ApplicationExtension] | None = None) -> FastAPI:
     """创建显式绑定 scope resolver 的 FastAPI 应用。
 
     ``scope_resolver`` 是必填参数；适配宿主可注入自己的可信 resolver、兼容的
@@ -2194,6 +2194,7 @@ def create_app(*, scope_resolver, service_factory: ScopeServiceFactory | None = 
         callback_verifier=callback_verifier,
         agent_input_provider=agent_input_provider,
         workspace_provider=workspace_provider,
+        reverse_image_provider_binding=reverse_image_provider_binding,
         extensions=extensions,
     )
 

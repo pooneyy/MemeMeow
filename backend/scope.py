@@ -304,10 +304,13 @@ class ScopeServiceFactory:
 
             metadata = PostgresMetadataService(self.resources, scope_id=context.scope_id)
             search = PostgresSearchService(self.settings, self.resources, metadata, scope_id=context.scope_id)
-            reverse_kwargs: dict[str, Any] = {
-                "scope_id": context.scope_id,
-                "provider": self._task_config.get("reverse_provider"),
-            }
+            reverse_kwargs: dict[str, Any] = {"scope_id": context.scope_id}
+            provider_binding = self._task_config.get("reverse_provider_binding")
+            if provider_binding is not None:
+                reverse_kwargs["provider_binding"] = provider_binding
+            elif self._task_config.get("reverse_provider") is not None:
+                # 保留旧宿主 callable 注入入口；新宿主应传完整 provider binding。
+                reverse_kwargs["provider"] = self._task_config["reverse_provider"]
             if self._task_config.get("operation_policy") is not None:
                 reverse_kwargs["operation_policy"] = self._task_config["operation_policy"]
             if self._task_config.get("grant_store") is not None:

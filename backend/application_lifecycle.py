@@ -38,7 +38,7 @@ from backend.operation_policy import (
 )
 from backend.pg_services import PostgresMetadataService, PostgresSearchService, PostgresTaskService, PostgresTaskWorkerManager
 from backend.paths import PathResolver
-from backend.reverse_image import ReverseImageService
+from backend.reverse_image import ReverseImageProviderBinding, ReverseImageService
 from backend.scope import LocalScopeResolver, ScopeServiceFactory, ScopeServices
 from backend.visual import VisualInferenceClient, VisualSearchService
 
@@ -420,6 +420,9 @@ def _build_scope_runtime(
     """
     app = setup.app
     settings = setup.settings
+    provider_binding = getattr(app.state, "reverse_image_provider_binding", None)
+    if provider_binding is not None and not isinstance(provider_binding, ReverseImageProviderBinding):
+        raise DatabaseError("reverse_image_provider_binding_invalid")
     factory: Any | None = setup.configured_factory
     shared_worker_executor: ThreadPoolExecutor | None = None
     worker_manager: PostgresTaskWorkerManager | None = None
@@ -470,19 +473,27 @@ def _build_scope_runtime(
             local_scope = ScopeContext("local")
             local_metadata = (metadata_factory or PostgresMetadataService)(app.state.database, scope_id=local_scope)
             local_search = (search_factory or PostgresSearchService)(settings, app.state.database, local_metadata, scope_id=local_scope)
+            reverse_image_kwargs: dict[str, Any] = {
+                "scope_id": local_scope,
+                "operation_policy": app.state.operation_policy_gateway,
+                "grant_store": app.state.operation_grants,
+            }
+            if provider_binding is not None:
+                reverse_image_kwargs["provider_binding"] = provider_binding
             try:
                 local_reverse_image = (reverse_image_factory or ReverseImageService)(
                     settings,
                     app.state.database,
-                    scope_id=local_scope,
-                    operation_policy=app.state.operation_policy_gateway,
-                    grant_store=app.state.operation_grants,
+                    **reverse_image_kwargs,
                 )
             except TypeError as exc:
                 if "operation_policy" not in str(exc) and "grant_store" not in str(exc):
                     raise
                 # 兼容尚未升级的轻量 facade 夹具；真实服务支持 policy 参数。
-                local_reverse_image = (reverse_image_factory or ReverseImageService)(settings, app.state.database, scope_id=local_scope)
+                fallback_kwargs: dict[str, Any] = {"scope_id": local_scope}
+                if provider_binding is not None:
+                    fallback_kwargs["provider_binding"] = provider_binding
+                local_reverse_image = (reverse_image_factory or ReverseImageService)(settings, app.state.database, **fallback_kwargs)
             local_visual_search = (visual_search_factory or VisualSearchService)(settings, app.state.database, scope_id=local_scope)
             local_tasks = (task_service_factory or PostgresTaskService)(
                 app.state.database,
@@ -549,6 +560,7 @@ def _build_scope_runtime(
                 "executor": shared_worker_executor,
                 "operation_policy": app.state.operation_policy_gateway,
                 "grant_store": app.state.operation_grants,
+                "reverse_provider_binding": provider_binding,
                 "visual_candidate_preparer": prepare_visual_candidates,
                 "register_handlers": register_handlers,
                 "start_services": start_scope_services,

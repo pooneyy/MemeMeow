@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,9 +12,11 @@ import pytest
 from backend.reverse_image import (
     GoogleVisionWebDetectionProvider,
     ReverseImageError,
+    ReverseImageProviderBinding,
     ReverseImageRequest,
     ReverseImageService,
     SerpApiGoogleLensProvider,
+    _fingerprint,
     _is_empty,
     _normalize_google_web_detection,
 )
@@ -24,11 +27,44 @@ def _request() -> ReverseImageRequest:
     return ReverseImageRequest(image=b"test-image", filename="meme.png", task_id="task")
 
 
-def test_cache_identity_isolated_between_google_and_serpapi() -> None:
-    """同一图片在两个 provider 下必须产生不同缓存身份。"""
+def test_cache_identity_isolated_by_provider_engine_and_variant() -> None:
+    """同一图片的 provider、engine 或变体变化时必须产生不同缓存键。"""
     request = _request()
     image_sha = "a" * 64
-    assert request.identity(image_sha) != request.identity(image_sha, provider="serpapi", engine="google_lens")
+    default_identity = request.identity(image_sha)
+    provider_identity = request.identity(image_sha, provider="serpapi", engine="google_lens")
+    variant_identity = request.identity(image_sha, cache_variant="alternate")
+
+    assert default_identity != provider_identity
+    assert default_identity != variant_identity
+    assert _fingerprint(default_identity) != _fingerprint(variant_identity)
+    assert set(default_identity) == {"provider", "engine", "cache_variant", "image_sha256", "search_type", "language", "country", "query", "auto_crop"}
+
+
+def test_provider_binding_freezes_identity_and_call_target(tmp_path: Path) -> None:
+    """宿主绑定固定保存非秘密身份，并由服务使用同一个调用对象。"""
+
+    def search(_request: ReverseImageRequest) -> dict[str, object]:
+        """返回合法空结果，供绑定调用对象测试使用。"""
+        return {"visual_matches": []}
+
+    binding = ReverseImageProviderBinding(name="host_provider", engine="visual_search", cache_variant="verified", search=search)
+    settings = SimpleNamespace(
+        reverse_image_provider="google_vision",
+        google_cloud_project=None,
+        google_application_credentials=None,
+        serpapi_api_key=None,
+        data_root=tmp_path / "data",
+        reverse_image_cache_root=tmp_path / "cache",
+    )
+    service = ReverseImageService(settings, SimpleNamespace(), provider_binding=binding)
+
+    assert service.provider_name == "host_provider"
+    assert service.provider_engine == "visual_search"
+    assert service.provider_cache_variant == "verified"
+    assert service._provider() is search
+    with pytest.raises(FrozenInstanceError):
+        binding.name = "changed"  # type: ignore[misc]
 
 
 def test_service_selects_only_the_configured_provider(tmp_path: Path) -> None:

@@ -24,7 +24,7 @@ from backend.config import Settings
 from backend.callbacks import CallbackBinding, callback_input_digest
 from backend.database import DatabaseError, DatabaseResources, StorageCoordinator, create_engine_for_url
 from backend.pg_services import PostgresTaskService
-from backend.reverse_image import ReverseImageError, ReverseImageRequest, ReverseImageService, _fingerprint
+from backend.reverse_image import ReverseImageError, ReverseImageProviderBinding, ReverseImageRequest, ReverseImageService, _fingerprint
 
 
 def _test_database_url() -> str | None:
@@ -175,6 +175,40 @@ def test_auto_cache_miss_then_hit_counts_one_provider_call(postgres_resources):
         assert audit["used"] is True
         assert audit["cache_hits"] == 1
         assert audit["provider_calls"] == 1
+
+
+def test_provider_binding_variant_isolates_cache_and_snapshot(postgres_resources):
+    """同一 provider 的传输变体必须分别调用并写入各自缓存身份。"""
+    resources, settings = postgres_resources
+    calls: list[str] = []
+
+    def provider(_request: ReverseImageRequest) -> dict[str, Any]:
+        """记录真实 search 链路调用并返回合法候选。"""
+        calls.append("called")
+        return {"visual_matches": [{"title": "隔离候选"}]}
+
+    task_id, _owner, _generation = _running_task(resources, "auto")
+    verified = ReverseImageProviderBinding("host_provider", "visual_search", "verified", provider)
+    unverified = ReverseImageProviderBinding("host_provider", "visual_search", "unverified", provider)
+    verified_service = ReverseImageService(settings, resources, provider_binding=verified)
+    unverified_service = ReverseImageService(settings, resources, provider_binding=unverified)
+
+    assert verified_service.search(_request(task_id, "verified-miss"))["cache"]["status"] == "miss"
+    assert verified_service.search(_request(task_id, "verified-hit"))["cache"]["status"] == "hit"
+    assert unverified_service.search(_request(task_id, "unverified-miss"))["cache"]["status"] == "miss"
+    assert unverified_service.search(_request(task_id, "unverified-hit"))["cache"]["status"] == "hit"
+    assert calls == ["called", "called"]
+
+    request = _request(task_id)
+    image_sha = hashlib.sha256(request.image).hexdigest()
+    verified_key = _fingerprint(request.identity(image_sha, provider="host_provider", engine="visual_search", cache_variant="verified"))
+    snapshot = verified_service.cache.load(verified_key)
+    assert snapshot is not None
+    assert {key: snapshot[key] for key in ("provider", "engine", "cache_variant")} == {
+        "provider": "host_provider",
+        "engine": "visual_search",
+        "cache_variant": "verified",
+    }
 
 
 def test_provider_failure_is_counted_and_finished(postgres_resources):

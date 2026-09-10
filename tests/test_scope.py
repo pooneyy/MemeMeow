@@ -12,6 +12,7 @@ from fastapi import HTTPException
 import api as api_module
 from api import bind_request_scope, create_app
 from backend.database import ScopeContext
+from backend.reverse_image import ReverseImageProviderBinding
 from backend.scope import (
     LocalScopeResolver,
     ScopeResolutionError,
@@ -39,6 +40,11 @@ class _ClosedScopeResolver:
         """返回宿主认证后绑定的 scope，不读取客户端请求字段。"""
         del request
         return "scope-a"
+
+
+def _empty_reverse_image_search(_request) -> dict[str, object]:
+    """返回合法空结果，供公共 provider binding 装配测试使用。"""
+    return {"visual_matches": []}
 
 
 def _install_lifespan_doubles(monkeypatch, tmp_path: Path) -> SimpleNamespace:
@@ -171,11 +177,13 @@ def _install_lifespan_doubles(monkeypatch, tmp_path: Path) -> SimpleNamespace:
             """记录 scope 专属批次收束回调。"""
             self.finalizer = callback
 
+    reverse_provider_bindings: list[object | None] = []
+
     class DummyReverse:
         """scope-bound 反向图片 facade 替身。"""
 
-        def __init__(self, _settings, _resources, *, scope_id, provider=None):
-            del provider
+        def __init__(self, _settings, _resources, *, scope_id, provider=None, provider_binding=None, **_kwargs):
+            reverse_provider_bindings.append(provider_binding if provider_binding is not None else provider)
             self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
             service_scope_calls.append(self.scope.scope_id)
 
@@ -216,7 +224,15 @@ def _install_lifespan_doubles(monkeypatch, tmp_path: Path) -> SimpleNamespace:
     monkeypatch.setattr(api_module, "PostgresTaskService", DummyTasks)
     monkeypatch.setattr(api_module, "ReverseImageService", DummyReverse)
     monkeypatch.setattr(api_module, "VisualSearchService", DummyVisual)
-    return SimpleNamespace(engine=engine, settings=settings, resources=resources, check_calls=check_calls, service_scope_calls=service_scope_calls, worker_class=FakeWorkerManager)
+    return SimpleNamespace(
+        engine=engine,
+        settings=settings,
+        resources=resources,
+        check_calls=check_calls,
+        service_scope_calls=service_scope_calls,
+        reverse_provider_bindings=reverse_provider_bindings,
+        worker_class=FakeWorkerManager,
+    )
 
 
 def test_local_scope_resolver_ignores_client_fields_and_is_immutable() -> None:
@@ -278,6 +294,23 @@ def test_create_app_keeps_host_factory_injection() -> None:
     application = create_app(scope_resolver=LocalScopeResolver("local"), service_factory=factory, agent_input_provider=provider)
     assert application.state.service_factory is factory
     assert application.state.agent_input_provider is provider
+
+
+def test_create_app_freezes_reverse_image_provider_binding() -> None:
+    """宿主 provider binding 只从应用工厂进入 state，模块级入口保持原行为。"""
+    binding = ReverseImageProviderBinding("host_provider", "visual_search", "verified", _empty_reverse_image_search)
+    application = create_app(scope_resolver=LocalScopeResolver("local"), reverse_image_provider_binding=binding)
+
+    assert application.state.reverse_image_provider_binding is binding
+    assert not hasattr(api_module.app.state, "reverse_image_provider_binding")
+
+
+def test_create_app_rejects_binding_with_custom_service_factory() -> None:
+    """自定义 factory 与公共 binding 不能同时声明，避免绑定被静默忽略。"""
+    binding = ReverseImageProviderBinding("host_provider", "visual_search", "verified", _empty_reverse_image_search)
+
+    with pytest.raises(ValueError, match="requires_managed_factory"):
+        create_app(scope_resolver=LocalScopeResolver("local"), service_factory=object(), reverse_image_provider_binding=binding)
 
 
 def test_application_extension_registers_routes_once() -> None:
@@ -608,6 +641,46 @@ def test_explicit_oss_local_resolver_keeps_local_preflight_and_facade(monkeypatc
     assert doubles.engine.disposed is True
 
 
+def test_lifecycle_passes_provider_binding_to_local_service_and_scope_factory(monkeypatch, tmp_path: Path) -> None:
+    """生命周期把同一宿主绑定交给 local 服务和后续 scope factory。"""
+    binding = ReverseImageProviderBinding("host_provider", "visual_search", "verified", _empty_reverse_image_search)
+    doubles = _install_lifespan_doubles(monkeypatch, tmp_path)
+    application = create_app(scope_resolver=LocalScopeResolver("local"), reverse_image_provider_binding=binding)
+
+    async def exercise() -> None:
+        """运行生命周期并检查两个公共装配位置收到同一绑定。"""
+        async with api_module.lifespan(application):
+            assert doubles.reverse_provider_bindings == [binding]
+            assert application.state.service_factory._task_config["reverse_provider_binding"] is binding
+
+    asyncio.run(exercise())
+
+
+def test_lifecycle_compatibility_fallback_keeps_provider_binding(monkeypatch, tmp_path: Path) -> None:
+    """旧 facade 不接受 policy 参数时，兼容重试仍必须保留 provider binding。"""
+    binding = ReverseImageProviderBinding("host_provider", "visual_search", "verified", _empty_reverse_image_search)
+    doubles = _install_lifespan_doubles(monkeypatch, tmp_path)
+    captured: list[object | None] = []
+
+    class LegacyReverse:
+        """模拟只支持 scope 和新 provider binding 的轻量 facade。"""
+
+        def __init__(self, _settings, _resources, *, scope_id, provider_binding=None):
+            captured.append(provider_binding)
+            self.scope = scope_id if isinstance(scope_id, ScopeContext) else ScopeContext(scope_id)
+
+    monkeypatch.setattr(api_module, "ReverseImageService", LegacyReverse)
+    application = create_app(scope_resolver=LocalScopeResolver("local"), reverse_image_provider_binding=binding)
+
+    async def exercise() -> None:
+        """触发首次 TypeError 和兼容重试，验证绑定没有被丢弃。"""
+        async with api_module.lifespan(application):
+            assert captured == [binding]
+
+    asyncio.run(exercise())
+    assert doubles.engine.disposed is True
+
+
 def test_many_scope_facades_share_one_process_worker_manager(monkeypatch) -> None:
     """大量 scope 只创建轻量 facade，不复制 Worker、线程池或 owner。"""
     import backend.pg_services as pg_services
@@ -640,11 +713,14 @@ def test_many_scope_facades_share_one_process_worker_manager(monkeypatch) -> Non
         def set_batch_finalizer(self, _callback):
             """兼容批次 finalizer 注册钩子。"""
 
+    captured_bindings: list[object | None] = []
+
     class DummyReverse:
         """反向图片 facade 测试替身。"""
 
-        def __init__(self, _settings, _resources, *, scope_id, provider=None):
+        def __init__(self, _settings, _resources, *, scope_id, provider=None, provider_binding=None):
             self.scope = scope_id
+            captured_bindings.append(provider_binding if provider_binding is not None else provider)
 
     class DummyVisual:
         """视觉 facade 测试替身。"""
@@ -677,13 +753,15 @@ def test_many_scope_facades_share_one_process_worker_manager(monkeypatch) -> Non
 
     settings = SimpleNamespace(opencode_concurrency=2, agent_backpressure=32, settings_version="test", worker_lease_seconds=120, worker_max_attempts=3)
     manager_resources = SimpleNamespace(factory=lambda: EmptySession())
-    factory = ScopeServiceFactory(manager_resources, settings)
+    binding = ReverseImageProviderBinding("host_provider", "visual_search", "verified", _empty_reverse_image_search)
+    factory = ScopeServiceFactory(manager_resources, settings, task_config={"reverse_provider_binding": binding})
     try:
         services = [factory.for_scope(f"scope-{index}") for index in range(100)]
         assert factory._services == {}
         assert len({id(service.tasks.worker_manager) for service in services}) == 1
         assert factory._worker_manager.worker_count == 1
         assert factory._worker_manager.owner == services[0].tasks.worker_manager.owner
+        assert captured_bindings == [binding] * 100
     finally:
         factory.shutdown()
 

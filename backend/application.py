@@ -16,6 +16,7 @@ from backend.app_extensions import ApplicationExtension
 from backend.database import ScopeContext
 from backend.errors import ErrorBody
 from backend.operation_policy import AllowAllOperationPolicy, OperationPolicyError
+from backend.reverse_image import ReverseImageProviderBinding
 from backend.scope import LocalScopeResolver, ScopeResolutionError, ScopeServiceFactory
 
 
@@ -46,6 +47,7 @@ def create_application(
     callback_verifier: object | None = None,
     agent_input_provider: Callable[[ScopeContext, Any], str | Any] | None = None,
     workspace_provider: object | None = None,
+    reverse_image_provider_binding: ReverseImageProviderBinding | None = None,
     extensions: Sequence[ApplicationExtension] | None = None,
 ) -> FastAPI:
     """创建一个绑定可信依赖的公共应用。
@@ -56,6 +58,11 @@ def create_application(
     """
     _validate_resolver(scope_resolver)
     _validate_operation_policy(operation_policy)
+    if reverse_image_provider_binding is not None and not isinstance(reverse_image_provider_binding, ReverseImageProviderBinding):
+        raise ValueError("reverse_image_provider_binding_invalid")
+    if service_factory is not None and reverse_image_provider_binding is not None:
+        # 自定义 factory 完全拥有 scope 服务装配，不能同时声明一个不会被它消费的绑定。
+        raise ValueError("reverse_image_provider_binding_requires_managed_factory")
     configured_extensions = tuple(extensions or ())
     created = FastAPI(
         title=route_template.title,
@@ -95,6 +102,8 @@ def create_application(
         created.state.agent_input_provider = agent_input_provider
     if workspace_provider is not None:
         created.state.workspace_provider = workspace_provider
+    if reverse_image_provider_binding is not None:
+        created.state.reverse_image_provider_binding = reverse_image_provider_binding
     return created
 
 
