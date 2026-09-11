@@ -389,10 +389,11 @@ def test_callback_asgi_authenticates_before_body_and_scope_factory() -> None:
         """发送未认证和已认证超限请求。"""
         transport = httpx.ASGITransport(app=application)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            unauthenticated = await client.post("/internal/reverse-image/search", content=b"x" * 600_000)
-            authenticated = await client.post(
-                "/internal/reverse-image/search",
-                content=b"x" * 600_000,
+                unauthenticated = await client.post("/internal/reverse-image/search", content=b"x" * (22 * 1024 * 1024))
+                authenticated = await client.post(
+                    "/internal/reverse-image/search",
+                    content=b"x" * (22 * 1024 * 1024),
+
                 headers={"X-MemeMeow-Callback": token},
             )
         return unauthenticated, authenticated

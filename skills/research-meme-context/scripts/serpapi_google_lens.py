@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-MAX_UPLOAD_BYTES = 500 * 1024
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 EMPTY_TTL = timedelta(days=3)
 CACHE_SCHEMA_VERSION = 1
 REMOVED_RESPONSE_KEYS = {"api_key", "image_id", "id", "json_endpoint", "html_endpoint", "google_lens_url", "raw_html_file", "serpapi_link", "serpapi_exact_matches_link", "about_page_serpapi_link"}
@@ -174,7 +174,7 @@ def _multipart(fields: dict[str, str], image: bytes, filename: str) -> tuple[byt
 
 
 def main(arguments: list[str] | None = None) -> int:
-    """读取受限图片、提交后端接口并原样输出统一 JSON。"""
+    """读取不超过 20 MiB 的图片、提交后端接口并原样输出统一 JSON。"""
     args = parse_args(arguments)
     if not args.task_id:
         print("缺少 MEMEMEOW_AGENT_TASK_ID，请从任务运行环境调用", file=sys.stderr)
@@ -186,7 +186,7 @@ def main(arguments: list[str] | None = None) -> int:
         print("图片文件不存在或无法读取", file=sys.stderr)
         return 2
     if len(content) > MAX_UPLOAD_BYTES:
-        print("图片超过 500 KB 上传限制", file=sys.stderr)
+        print("图片超过 20 MiB 上传限制", file=sys.stderr)
         return 2
     fields = {"task_id": args.task_id, "search_type": args.search_type, "language": args.language, "auto_crop": str(bool(args.auto_crop)).lower(), "refresh": str(bool(args.refresh)).lower()}
     for name in ("country", "query", "request_id"):

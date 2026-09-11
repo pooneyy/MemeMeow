@@ -151,6 +151,23 @@ def test_thin_cli_omits_request_id_by_default_but_keeps_legacy_option(lens_modul
     assert b"name=\"request_id\"" not in body
 
 
+def test_thin_cli_accepts_images_larger_than_500_kib(lens_module, tmp_path: Path, monkeypatch, capsys) -> None:
+    """薄 CLI 不再把 500 KiB 当作反向图片接口的上限。"""
+    image = tmp_path / "image.png"
+    image.write_bytes(b"x" * (500 * 1024 + 1))
+    monkeypatch.setenv("MEMEMEOW_AGENT_CALLBACK_TOKEN", "task-callback-token")
+
+    class Response:
+        """最小 HTTP 响应替身。"""
+
+        def read(self) -> bytes:
+            """返回后端供应商无关响应。"""
+            return b"{}"
+
+    monkeypatch.setattr(lens_module, "urlopen", lambda request, timeout: Response())
+    assert lens_module.main([str(image), "--task-id", "task-a"]) == 0
+
+
 def test_thin_cli_prints_authoritative_response_without_provider_credentials(lens_module, tmp_path: Path, monkeypatch, capsys) -> None:
     """CLI 原样输出后端权威 request ID，环境只需要 callback token。"""
     image = tmp_path / "image.png"

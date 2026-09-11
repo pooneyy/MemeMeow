@@ -42,7 +42,7 @@ from backend.database import DatabaseError, DatabaseResources, ReverseImageUsage
 from backend.operation_policy import AllowAllOperationPolicy, GrantAssociation, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, require_allowed
 
 
-MAX_UPLOAD_BYTES = 500 * 1024
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 CACHE_SCHEMA_VERSION = 1
 EMPTY_TTL = timedelta(days=3)
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
@@ -115,7 +115,7 @@ class ReverseImageRequest:
         if mime_type not in SUPPORTED_IMAGE_TYPES:
             raise ReverseImageError("invalid_image_format", "图片格式不受支持", status_code=400)
         if not self.image or len(self.image) > MAX_UPLOAD_BYTES:
-            raise ReverseImageError("image_too_large", "图片超过 500 KB 上传限制", status_code=413)
+            raise ReverseImageError("image_too_large", "图片超过 20 MiB 上传限制", status_code=413)
         try:
             from PIL import Image
 
@@ -229,7 +229,7 @@ def derive_controlled_crop(content: bytes, *, filename: str = "image.png") -> tu
     except Exception as exc:  # noqa: BLE001 - 统一隐藏解码器细节
         raise ReverseImageError("invalid_image", "上传内容不是有效图片", status_code=400) from exc
     if not value or len(value) > MAX_UPLOAD_BYTES:
-        raise ReverseImageError("image_too_large", "图片超过 500 KB 上传限制", status_code=413)
+        raise ReverseImageError("image_too_large", "图片超过 20 MiB 上传限制", status_code=413)
     return value, hashlib.sha256(value).hexdigest()
 
 

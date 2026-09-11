@@ -162,6 +162,17 @@ def _harness(content: bytes | None = None, *, binding: CallbackBinding | None = 
     return request, binding, content, database, service
 
 
+def test_reverse_image_callback_allows_image_above_500_kib() -> None:
+    """callback 领域层接受超过旧 500 KiB 限制的有效图片。"""
+    output = io.BytesIO()
+    Image.effect_noise((1024, 1024), 128).save(output, format="PNG", compress_level=0)
+    content = output.getvalue()
+    assert len(content) > 500 * 1024
+    request, binding, _original, database, service = _harness(content)
+    result = _call(request, binding, content, database, service)
+    assert result == {"ok": True}
+
+
 def test_reverse_image_route_and_legacy_handler_remain_available() -> None:
     """canonical route metadata 与旧 handler 名称保持兼容。"""
     routes = [route for route in api.app.routes if getattr(route, "path", None) == CALLBACK_PATH]

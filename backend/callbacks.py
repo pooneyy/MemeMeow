@@ -281,7 +281,7 @@ class CallbackRegistration:
     path: str
     task_types: frozenset[str]
     operations: frozenset[str]
-    max_body_bytes: int = 512 * 1024
+    max_body_bytes: int = 21 * 1024 * 1024
     side_effect: str = "read_only"
     target_validator: str = "task"
 
